@@ -223,76 +223,6 @@ func gitCommit(ctx context.Context, filePath string, message string) error {
 	return nil
 }
 
-// gitCommitBeadsDir stages and commits only sync-related files in .beads/
-// This ensures bd sync doesn't accidentally commit other staged files.
-// Only stages specific sync files (issues.jsonl, deletions.jsonl, metadata.json)
-// to avoid staging gitignored snapshot files that may be tracked.
-// Uses RepoContext to ensure git commands run in the correct repository.
-// Handles worktrees and redirected beads directories.
-func gitCommitBeadsDir(ctx context.Context, message string) error {
-	rc, err := beads.GetRepoContext()
-	if err != nil {
-		return fmt.Errorf("getting repo context: %w", err)
-	}
-
-	// Stage only the specific sync-related files
-	// This avoids staging gitignored snapshot files (beads.*.jsonl, *.meta.json)
-	// that may still be tracked from before they were added to .gitignore
-	syncFiles := []string{
-		filepath.Join(rc.BeadsDir, "issues.jsonl"),
-		filepath.Join(rc.BeadsDir, "deletions.jsonl"),
-		filepath.Join(rc.BeadsDir, "interactions.jsonl"),
-		filepath.Join(rc.BeadsDir, "metadata.json"),
-	}
-
-	// Only add files that exist
-	var filesToAdd []string
-	for _, f := range syncFiles {
-		if _, err := os.Stat(f); err == nil {
-			// Convert to relative path from repo root for git operations
-			relPath, err := filepath.Rel(rc.RepoRoot, f)
-			if err != nil {
-				relPath = f // Fall back to absolute path if relative fails
-			}
-			filesToAdd = append(filesToAdd, relPath)
-		}
-	}
-
-	if len(filesToAdd) == 0 {
-		return fmt.Errorf("no sync files found to commit")
-	}
-
-	// Stage only the sync files
-	addArgs := append([]string{"add"}, filesToAdd...)
-	addCmd := rc.GitCmd(ctx, addArgs...)
-	if err := addCmd.Run(); err != nil {
-		return fmt.Errorf("git add failed: %w", err)
-	}
-
-	// Generate message if not provided
-	if message == "" {
-		message = fmt.Sprintf("bd sync: %s", time.Now().Format("2006-01-02 15:04:05"))
-	}
-
-	// Commit only .beads/ files using -- pathspec
-	// This prevents accidentally committing other staged files that the user
-	// may have staged but wasn't ready to commit yet.
-	relBeadsDir, err := filepath.Rel(rc.RepoRoot, rc.BeadsDir)
-	if err != nil {
-		relBeadsDir = rc.BeadsDir // Fall back to absolute path if relative fails
-	}
-
-	// Use config-based author and signing options with pathspec
-	commitArgs := buildCommitArgs(message, "--", relBeadsDir)
-	commitCmd := rc.GitCmd(ctx, commitArgs...)
-	output, err := commitCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git commit failed: %w\n%s", err, output)
-	}
-
-	return nil
-}
-
 // hasGitRemote checks if a git remote exists in the beads repository.
 // Uses RepoContext to ensure git commands run in the correct repository
 // regardless of current working directory.
@@ -435,49 +365,6 @@ func gitPull(ctx context.Context, configuredRemote string) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git pull failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// gitPush pushes to the current branch's upstream in the beads repository.
-// Returns nil if no remote configured (local-only mode).
-// If configuredRemote is non-empty, pushes to that remote explicitly.
-// This allows respecting the sync.remote bd config.
-// Uses RepoContext to ensure git commands run in the correct repository.
-func gitPush(ctx context.Context, configuredRemote string) error {
-	// Check if any remote exists (support local-only repos)
-	if !hasGitRemote(ctx) {
-		return nil // Gracefully skip - local-only mode
-	}
-
-	rc, err := beads.GetRepoContext()
-	if err != nil {
-		return fmt.Errorf("getting repo context: %w", err)
-	}
-
-	// If configuredRemote is set, push explicitly to that remote with current branch
-	if configuredRemote != "" {
-		// Get current branch name
-		branchCmd := rc.GitCmd(ctx, "symbolic-ref", "--short", "HEAD")
-		branchOutput, err := branchCmd.Output()
-		if err != nil {
-			return fmt.Errorf("failed to get current branch: %w", err)
-		}
-		branch := strings.TrimSpace(string(branchOutput))
-
-		cmd := rc.GitCmd(ctx, "push", configuredRemote, branch) //nolint:gosec // G204: configuredRemote from bd config
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("git push failed: %w\n%s", err, output)
-		}
-		return nil
-	}
-
-	// Default: use git's default push behavior
-	cmd := rc.GitCmd(ctx, "push")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git push failed: %w\n%s", err, output)
 	}
 	return nil
 }

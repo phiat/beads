@@ -1,13 +1,10 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -52,36 +49,10 @@ func runShip(cmd *cobra.Command, args []string) {
 	var issues []*types.Issue
 	var err error
 
-	// Ship requires direct store access for label operations
-	if daemonClient != nil && store == nil {
-		store, err = sqlite.New(ctx, dbPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
-			os.Exit(1)
-		}
-		defer func() { _ = store.Close() }()
-	}
-
-	if daemonClient != nil {
-		// Use RPC to list issues with the export label
-		listArgs := &rpc.ListArgs{
-			LabelsAny: []string{exportLabel},
-		}
-		resp, err := daemonClient.List(listArgs)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing issues: %v\n", err)
-			os.Exit(1)
-		}
-		if err := json.Unmarshal(resp.Data, &issues); err != nil {
-			fmt.Fprintf(os.Stderr, "Error unmarshaling issues: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		issues, err = store.GetIssuesByLabel(ctx, exportLabel)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing issues: %v\n", err)
-			os.Exit(1)
-		}
+	issues, err = store.GetIssuesByLabel(ctx, exportLabel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing issues: %v\n", err)
+		os.Exit(1)
 	}
 
 	if len(issues) == 0 {
@@ -156,7 +127,6 @@ func runShip(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Error adding label: %v\n", err)
 		os.Exit(1)
 	}
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
 		outputJSON(map[string]interface{}{

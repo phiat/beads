@@ -1,12 +1,12 @@
 package doctor
 
 import (
-	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/steveyegge/beads/internal/config"
 )
 
 func TestCheckSyncDivergence(t *testing.T) {
@@ -120,188 +120,49 @@ func TestCheckSyncDivergence(t *testing.T) {
 			t.Errorf("detail=%q want to mention JSONL or uncommitted", check.Detail)
 		}
 	})
-}
 
-func TestCheckSQLiteMtimeDivergence(t *testing.T) {
-	t.Run("no database", func(t *testing.T) {
-		dir := mkTmpDirInTmp(t, "bd-mtime-nodb-*")
+	t.Run("JSONL differs in dolt-native mode suggests restore", func(t *testing.T) {
+		// Reset and initialize config for this test
+		config.ResetForTesting()
+		if err := config.Initialize(); err != nil {
+			t.Fatalf("Initialize failed: %v", err)
+		}
+		// Set sync mode to dolt-native for this test
+		config.Set("sync.mode", string(config.SyncModeDoltNative))
+		defer func() {
+			// Reset to clean state after test
+			config.ResetForTesting()
+			_ = config.Initialize()
+		}()
+
+		dir := mkTmpDirInTmp(t, "bd-sync-div-dolt-*")
+		initRepo(t, dir, "main")
+
+		// Create .beads with JSONL and commit it
 		beadsDir := filepath.Join(dir, ".beads")
 		if err := os.MkdirAll(beadsDir, 0755); err != nil {
 			t.Fatal(err)
 		}
-
-		issue := checkSQLiteMtimeDivergence(dir, beadsDir)
-		if issue != nil {
-			t.Errorf("expected nil issue for no database, got %+v", issue)
-		}
-	})
-
-	t.Run("no JSONL", func(t *testing.T) {
-		dir := mkTmpDirInTmp(t, "bd-mtime-nojsonl-*")
-		beadsDir := filepath.Join(dir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		// Create a dummy database
-		dbPath := filepath.Join(beadsDir, "beads.db")
-		db, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = db.Exec("CREATE TABLE issues (id TEXT)")
-		_, _ = db.Exec("CREATE TABLE metadata (key TEXT, value TEXT)")
-		db.Close()
-
-		issue := checkSQLiteMtimeDivergence(dir, beadsDir)
-		if issue != nil {
-			t.Errorf("expected nil issue for no JSONL, got %+v", issue)
-		}
-	})
-
-	t.Run("no last_import_time", func(t *testing.T) {
-		dir := mkTmpDirInTmp(t, "bd-mtime-noimport-*")
-		beadsDir := filepath.Join(dir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		// Create database without last_import_time
-		dbPath := filepath.Join(beadsDir, "beads.db")
-		db, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = db.Exec("CREATE TABLE issues (id TEXT)")
-		_, _ = db.Exec("CREATE TABLE metadata (key TEXT, value TEXT)")
-		db.Close()
-
-		// Create JSONL
 		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-		if err := os.WriteFile(jsonlPath, []byte(`{"id":"test-1"}`+"\n"), 0644); err != nil {
+		jsonlContent := `{"id":"test-1","title":"Test issue","status":"open"}` + "\n"
+		commitFile(t, dir, ".beads/issues.jsonl", jsonlContent, "add issues")
+
+		// Modify without committing
+		newContent := `{"id":"test-1","title":"Test issue","status":"closed"}` + "\n"
+		if err := os.WriteFile(jsonlPath, []byte(newContent), 0644); err != nil {
 			t.Fatal(err)
 		}
 
-		issue := checkSQLiteMtimeDivergence(dir, beadsDir)
-		if issue == nil {
-			t.Error("expected issue for missing last_import_time")
-		} else if issue.Type != "sqlite_mtime_stale" {
-			t.Errorf("type=%q want sqlite_mtime_stale", issue.Type)
+		check := CheckSyncDivergence(dir)
+		if check.Status != StatusWarning && check.Status != StatusError {
+			t.Errorf("status=%q want warning or error (msg=%q)", check.Status, check.Message)
 		}
-	})
-
-	t.Run("times match", func(t *testing.T) {
-		dir := mkTmpDirInTmp(t, "bd-mtime-match-*")
-		beadsDir := filepath.Join(dir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
+		// In dolt-native mode, should suggest git restore, not git add
+		if !strings.Contains(check.Fix, "git restore") {
+			t.Errorf("fix=%q want git restore for dolt-native mode", check.Fix)
 		}
-
-		// Create JSONL first
-		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-		if err := os.WriteFile(jsonlPath, []byte(`{"id":"test-1"}`+"\n"), 0644); err != nil {
-			t.Fatal(err)
-		}
-
-		// Get JSONL mtime
-		jsonlInfo, _ := os.Stat(jsonlPath)
-		importTime := jsonlInfo.ModTime()
-
-		// Create database with matching last_import_time
-		dbPath := filepath.Join(beadsDir, "beads.db")
-		db, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = db.Exec("CREATE TABLE issues (id TEXT)")
-		_, _ = db.Exec("CREATE TABLE metadata (key TEXT, value TEXT)")
-		_, _ = db.Exec("INSERT INTO metadata (key, value) VALUES (?, ?)",
-			"last_import_time", importTime.Format(time.RFC3339))
-		db.Close()
-
-		issue := checkSQLiteMtimeDivergence(dir, beadsDir)
-		if issue != nil {
-			t.Errorf("expected nil issue for matching times, got %+v", issue)
-		}
-	})
-
-	t.Run("JSONL newer than import", func(t *testing.T) {
-		dir := mkTmpDirInTmp(t, "bd-mtime-newer-*")
-		beadsDir := filepath.Join(dir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		// Create database with old last_import_time
-		dbPath := filepath.Join(beadsDir, "beads.db")
-		db, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = db.Exec("CREATE TABLE issues (id TEXT)")
-		_, _ = db.Exec("CREATE TABLE metadata (key TEXT, value TEXT)")
-		oldTime := time.Now().Add(-1 * time.Hour)
-		_, _ = db.Exec("INSERT INTO metadata (key, value) VALUES (?, ?)",
-			"last_import_time", oldTime.Format(time.RFC3339))
-		db.Close()
-
-		// Create JSONL (will have current mtime)
-		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-		if err := os.WriteFile(jsonlPath, []byte(`{"id":"test-1"}`+"\n"), 0644); err != nil {
-			t.Fatal(err)
-		}
-
-		issue := checkSQLiteMtimeDivergence(dir, beadsDir)
-		if issue == nil {
-			t.Error("expected issue for JSONL newer than import")
-		} else {
-			if issue.Type != "sqlite_mtime_stale" {
-				t.Errorf("type=%q want sqlite_mtime_stale", issue.Type)
-			}
-			if !strings.Contains(issue.FixCommand, "import") {
-				t.Errorf("fix=%q want import command", issue.FixCommand)
-			}
-		}
-	})
-
-	// Regression test: verify we read from metadata table, not config table.
-	// The sync code writes to metadata, so doctor must read from there.
-	// This catches the bug where doctor queried 'config' instead of 'metadata'.
-	t.Run("reads from metadata table not config", func(t *testing.T) {
-		dir := mkTmpDirInTmp(t, "bd-mtime-table-*")
-		beadsDir := filepath.Join(dir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		// Create JSONL first
-		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-		if err := os.WriteFile(jsonlPath, []byte(`{"id":"test-1"}`+"\n"), 0644); err != nil {
-			t.Fatal(err)
-		}
-
-		// Get JSONL mtime
-		jsonlInfo, _ := os.Stat(jsonlPath)
-		importTime := jsonlInfo.ModTime()
-
-		// Create database with BOTH config and metadata tables (realistic schema)
-		// Put last_import_time ONLY in metadata (as real sync code does)
-		dbPath := filepath.Join(beadsDir, "beads.db")
-		db, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = db.Exec("CREATE TABLE issues (id TEXT)")
-		_, _ = db.Exec("CREATE TABLE config (key TEXT, value TEXT)")
-		_, _ = db.Exec("CREATE TABLE metadata (key TEXT, value TEXT)")
-		// Only insert into metadata, NOT config
-		_, _ = db.Exec("INSERT INTO metadata (key, value) VALUES (?, ?)",
-			"last_import_time", importTime.Format(time.RFC3339))
-		db.Close()
-
-		issue := checkSQLiteMtimeDivergence(dir, beadsDir)
-		if issue != nil {
-			t.Errorf("expected nil issue when last_import_time is in metadata table, got %+v", issue)
+		if strings.Contains(check.Fix, "git add") {
+			t.Errorf("fix=%q should NOT suggest git add in dolt-native mode", check.Fix)
 		}
 	})
 }

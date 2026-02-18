@@ -31,7 +31,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -48,11 +48,11 @@ type LoadResult struct {
 
 // Loader handles loading molecule catalogs from hierarchical locations.
 type Loader struct {
-	store storage.Storage
+	store *dolt.DoltStore
 }
 
 // NewLoader creates a new molecule loader for the given storage.
-func NewLoader(store storage.Storage) *Loader {
+func NewLoader(store *dolt.DoltStore) *Loader {
 	return &Loader{store: store}
 }
 
@@ -149,27 +149,14 @@ func (l *Loader) loadMolecules(ctx context.Context, molecules []*types.Issue) (i
 
 	// Use batch creation with prefix validation skipped.
 	// Molecules have their own ID namespace (mol-*) independent of project prefix.
-	if sqliteStore, ok := l.store.(*sqlite.SQLiteStorage); ok {
-		opts := sqlite.BatchCreateOptions{
-			SkipPrefixValidation: true, // Molecules use their own prefix
-		}
-		if err := sqliteStore.CreateIssuesWithFullOptions(ctx, newMolecules, "molecules-loader", opts); err != nil {
-			return 0, fmt.Errorf("batch create molecules: %w", err)
-		}
-		return len(newMolecules), nil
+	opts := storage.BatchCreateOptions{
+		SkipPrefixValidation: true, // Molecules use their own prefix
+		OrphanHandling:       storage.OrphanAllow,
 	}
-
-	// Fallback for non-SQLite stores (e.g., memory storage in tests)
-	loaded := 0
-	for _, mol := range newMolecules {
-		if err := l.store.CreateIssue(ctx, mol, "molecules-loader"); err != nil {
-			debug.Logf("failed to load molecule %s: %v", mol.ID, err)
-			continue
-		}
-		loaded++
+	if err := l.store.CreateIssuesWithFullOptions(ctx, newMolecules, "molecules-loader", opts); err != nil {
+		return 0, fmt.Errorf("batch create molecules: %w", err)
 	}
-
-	return loaded, nil
+	return len(newMolecules), nil
 }
 
 // loadMoleculesFromFile loads molecules from a JSONL file.

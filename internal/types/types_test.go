@@ -202,7 +202,6 @@ func TestStatusIsValid(t *testing.T) {
 		{StatusInProgress, true},
 		{StatusBlocked, true},
 		{StatusClosed, true},
-		{StatusTombstone, true},
 		{Status("invalid"), false},
 		{Status(""), false},
 	}
@@ -211,79 +210,6 @@ func TestStatusIsValid(t *testing.T) {
 		t.Run(string(tt.status), func(t *testing.T) {
 			if got := tt.status.IsValid(); got != tt.valid {
 				t.Errorf("Status(%q).IsValid() = %v, want %v", tt.status, got, tt.valid)
-			}
-		})
-	}
-}
-
-func TestIsTombstone(t *testing.T) {
-	tests := []struct {
-		name   string
-		issue  Issue
-		expect bool
-	}{
-		{
-			name: "tombstone issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-			},
-			expect: true,
-		},
-		{
-			name: "open issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Open issue",
-				Status:    StatusOpen,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			expect: false,
-		},
-		{
-			name: "closed issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Closed issue",
-				Status:    StatusClosed,
-				Priority:  2,
-				IssueType: TypeTask,
-				ClosedAt:  timePtr(time.Now()),
-			},
-			expect: false,
-		},
-		{
-			name: "in_progress issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "In progress issue",
-				Status:    StatusInProgress,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			expect: false,
-		},
-		{
-			name: "blocked issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Blocked issue",
-				Status:    StatusBlocked,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			expect: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.issue.IsTombstone(); got != tt.expect {
-				t.Errorf("Issue.IsTombstone() = %v, want %v", got, tt.expect)
 			}
 		})
 	}
@@ -545,15 +471,16 @@ func TestIssueTypeIsValid(t *testing.T) {
 		{TypeTask, true},
 		{TypeEpic, true},
 		{TypeChore, true},
+		{TypeDecision, true},
+		{TypeMessage, true},
 		// Gas Town types are now custom types (not built-in)
-		{IssueType("message"), false},
 		{IssueType("merge-request"), false},
 		{IssueType("molecule"), false},
 		{IssueType("gate"), false},
 		{IssueType("agent"), false},
 		{IssueType("role"), false},
 		{IssueType("convoy"), false},
-		{IssueType("event"), false},
+		{TypeEvent, false},
 		{IssueType("slot"), false},
 		{IssueType("rig"), false},
 		// Invalid types
@@ -570,6 +497,67 @@ func TestIssueTypeIsValid(t *testing.T) {
 	}
 }
 
+// TestEventTypeValidation verifies that event type is accepted by validation
+// even without being in types.custom, since set-state creates event beads
+// internally for audit trail (GH#1356).
+func TestEventTypeValidation(t *testing.T) {
+	now := time.Now()
+	event := Issue{
+		Title:     "state change event",
+		Status:    StatusOpen,
+		Priority:  4,
+		IssueType: TypeEvent,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	// event is not a core work type
+	if TypeEvent.IsValid() {
+		t.Fatal("event should not be a core work type")
+	}
+
+	// event is an internal built-in type
+	if !TypeEvent.IsBuiltIn() {
+		t.Error("TypeEvent.IsBuiltIn() = false, want true")
+	}
+
+	// event should be accepted by IsValidWithCustom without explicit config
+	if !TypeEvent.IsValidWithCustom(nil) {
+		t.Error("TypeEvent.IsValidWithCustom(nil) = false, want true")
+	}
+
+	// ValidateWithCustom should accept event without custom types config
+	if err := event.ValidateWithCustom(nil, nil); err != nil {
+		t.Errorf("ValidateWithCustom() should accept event type, got: %v", err)
+	}
+
+	// event should also work alongside other custom types
+	if !TypeEvent.IsValidWithCustom([]string{"molecule", "gate"}) {
+		t.Error("TypeEvent.IsValidWithCustom(custom list) = false, want true")
+	}
+
+	// custom types must NOT be treated as built-in
+	if IssueType("molecule").IsBuiltIn() {
+		t.Error("IssueType(molecule).IsBuiltIn() = true, want false")
+	}
+	if IssueType("gate").IsBuiltIn() {
+		t.Error("IssueType(gate).IsBuiltIn() = true, want false")
+	}
+
+	// Normalize must not map event to a core type
+	if TypeEvent.Normalize() != TypeEvent {
+		t.Errorf("TypeEvent.Normalize() = %q, want %q", TypeEvent.Normalize(), TypeEvent)
+	}
+
+	// decision aliases
+	if IssueType("dec").Normalize() != TypeDecision {
+		t.Errorf("IssueType(dec).Normalize() = %q, want %q", IssueType("dec").Normalize(), TypeDecision)
+	}
+	if IssueType("adr").Normalize() != TypeDecision {
+		t.Errorf("IssueType(adr).Normalize() = %q, want %q", IssueType("adr").Normalize(), TypeDecision)
+	}
+}
+
 func TestIssueTypeRequiredSections(t *testing.T) {
 	tests := []struct {
 		issueType     IssueType
@@ -580,12 +568,13 @@ func TestIssueTypeRequiredSections(t *testing.T) {
 		{TypeFeature, 1, "## Acceptance Criteria"},
 		{TypeTask, 1, "## Acceptance Criteria"},
 		{TypeEpic, 1, "## Success Criteria"},
+		{TypeDecision, 3, "## Decision"},
 		{TypeChore, 0, ""},
+		{TypeMessage, 0, ""},
 		// Gas Town types are now custom and have no required sections
-		{IssueType("message"), 0, ""},
 		{IssueType("molecule"), 0, ""},
 		{IssueType("gate"), 0, ""},
-		{IssueType("event"), 0, ""},
+		{TypeEvent, 0, ""},
 		{IssueType("merge-request"), 0, ""},
 	}
 
@@ -950,238 +939,6 @@ func TestSortPolicyIsValid(t *testing.T) {
 				t.Errorf("SortPolicy(%q).IsValid() = %v, want %v", tt.policy, got, tt.valid)
 			}
 		})
-	}
-}
-
-func TestIsExpired(t *testing.T) {
-	now := time.Now()
-
-	tests := []struct {
-		name    string
-		issue   Issue
-		ttl     time.Duration
-		expired bool
-	}{
-		{
-			name: "non-tombstone issue never expires",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Open issue",
-				Status:    StatusOpen,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			ttl:     0,
-			expired: false,
-		},
-		{
-			name: "closed issue never expires",
-			issue: Issue{
-				ID:        "test-2",
-				Title:     "Closed issue",
-				Status:    StatusClosed,
-				Priority:  2,
-				IssueType: TypeTask,
-				ClosedAt:  timePtr(now),
-			},
-			ttl:     0,
-			expired: false,
-		},
-		{
-			name: "tombstone without DeletedAt does not expire",
-			issue: Issue{
-				ID:        "test-3",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: nil,
-			},
-			ttl:     0,
-			expired: false,
-		},
-		{
-			name: "tombstone within default TTL (30 days)",
-			issue: Issue{
-				ID:        "test-4",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-15 * 24 * time.Hour)), // 15 days ago
-			},
-			ttl:     0, // Use default TTL
-			expired: false,
-		},
-		{
-			name: "tombstone past default TTL (30 days)",
-			issue: Issue{
-				ID:        "test-5",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-35 * 24 * time.Hour)), // 35 days ago (past 30 days + 1 hour grace)
-			},
-			ttl:     0, // Use default TTL
-			expired: true,
-		},
-		{
-			name: "tombstone within custom TTL (7 days)",
-			issue: Issue{
-				ID:        "test-6",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-3 * 24 * time.Hour)), // 3 days ago
-			},
-			ttl:     7 * 24 * time.Hour,
-			expired: false,
-		},
-		{
-			name: "tombstone past custom TTL (7 days)",
-			issue: Issue{
-				ID:        "test-7",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-9 * 24 * time.Hour)), // 9 days ago (past 7 days + 1 hour grace)
-			},
-			ttl:     7 * 24 * time.Hour,
-			expired: true,
-		},
-		{
-			name: "tombstone at exact TTL boundary (within grace period)",
-			issue: Issue{
-				ID:        "test-8",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-30 * 24 * time.Hour)), // Exactly 30 days ago
-			},
-			ttl:     0, // Use default TTL (30 days + 1 hour grace)
-			expired: false,
-		},
-		{
-			name: "tombstone just past TTL boundary (beyond grace period)",
-			issue: Issue{
-				ID:        "test-9",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-(30*24*time.Hour + 2*time.Hour))), // 30 days + 2 hours ago
-			},
-			ttl:     0, // Use default TTL (30 days + 1 hour grace)
-			expired: true,
-		},
-		{
-			name: "tombstone within grace period",
-			issue: Issue{
-				ID:        "test-10",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-(30*24*time.Hour + 30*time.Minute))), // 30 days + 30 minutes ago
-			},
-			ttl:     0, // Use default TTL (30 days + 1 hour grace)
-			expired: false,
-		},
-		{
-			name: "tombstone with MinTombstoneTTL (7 days)",
-			issue: Issue{
-				ID:        "test-11",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-10 * 24 * time.Hour)), // 10 days ago
-			},
-			ttl:     MinTombstoneTTL, // 7 days
-			expired: true,
-		},
-		{
-			name: "tombstone with very short TTL (1 hour)",
-			issue: Issue{
-				ID:        "test-12",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-3 * time.Hour)), // 3 hours ago
-			},
-			ttl:     1 * time.Hour, // 1 hour + 1 hour grace = 2 hours total
-			expired: true,
-		},
-		{
-			name: "tombstone deleted in the future (clock skew)",
-			issue: Issue{
-				ID:        "test-13",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(1 * time.Hour)), // 1 hour in the future
-			},
-			ttl:     7 * 24 * time.Hour,
-			expired: false,
-		},
-		{
-			name: "negative TTL means immediately expired (bd-4q8 --hard mode)",
-			issue: Issue{
-				ID:        "test-14",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now), // Just deleted NOW
-			},
-			ttl:     -1, // Negative TTL = immediate expiration
-			expired: true,
-		},
-		{
-			name: "non-tombstone never expires even with negative TTL",
-			issue: Issue{
-				ID:        "test-15",
-				Title:     "Open issue",
-				Status:    StatusOpen,
-				Priority:  0,
-				IssueType: TypeTask,
-			},
-			ttl:     -1,
-			expired: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.issue.IsExpired(tt.ttl)
-			if got != tt.expired {
-				t.Errorf("Issue.IsExpired(%v) = %v, want %v", tt.ttl, got, tt.expired)
-			}
-		})
-	}
-}
-
-func TestTombstoneTTLConstants(t *testing.T) {
-	// Test that constants have expected values
-	if DefaultTombstoneTTL != 30*24*time.Hour {
-		t.Errorf("DefaultTombstoneTTL = %v, want %v", DefaultTombstoneTTL, 30*24*time.Hour)
-	}
-	if MinTombstoneTTL != 7*24*time.Hour {
-		t.Errorf("MinTombstoneTTL = %v, want %v", MinTombstoneTTL, 7*24*time.Hour)
-	}
-	if ClockSkewGrace != 1*time.Hour {
-		t.Errorf("ClockSkewGrace = %v, want %v", ClockSkewGrace, 1*time.Hour)
-	}
-
-	// Test that MinTombstoneTTL is less than DefaultTombstoneTTL
-	if MinTombstoneTTL >= DefaultTombstoneTTL {
-		t.Errorf("MinTombstoneTTL (%v) should be less than DefaultTombstoneTTL (%v)", MinTombstoneTTL, DefaultTombstoneTTL)
 	}
 }
 

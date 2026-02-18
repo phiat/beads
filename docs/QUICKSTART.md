@@ -15,7 +15,7 @@ go build -o bd ./cmd/bd
 First time in a repository:
 
 ```bash
-# Basic setup
+# Basic setup (prompts for contributor mode)
 bd init
 
 # Dolt backend (version-controlled SQL database)
@@ -33,6 +33,7 @@ bd init --branch beads-sync
 
 The wizard will:
 - Create `.beads/` directory and database
+- **Prompt for your role** (maintainer or contributor) unless a flag is provided
 - Import existing issues from git (if any)
 - Prompt to install git hooks (recommended)
 - Prompt to configure git merge driver (recommended)
@@ -42,7 +43,36 @@ Notes:
 - SQLite backend stores data in `.beads/beads.db`.
 - Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
 - Dolt backend runs **single-process-only**; daemon mode is disabled.
-- Dolt backend **auto-commits** after each successful write command by default (`dolt.auto-commit: on`). Disable with `bd --dolt-auto-commit off ...` or config.
+- Dolt backend **auto-commits** after each successful write command in embedded mode (`dolt.auto-commit: on`). In server mode, auto-commit defaults to OFF. Override with `bd --dolt-auto-commit off|on ...` or config.
+
+### Role Configuration
+
+During `bd init`, you'll be asked: "Contributing to someone else's repo? [y/N]"
+
+- Answer **Y** if you're contributing to a fork (runs contributor wizard)
+- Answer **N** if you're the maintainer or have push access
+
+This sets `git config beads.role` which determines how beads routes issues:
+
+| Role | Use Case | Issue Storage |
+|------|----------|---------------|
+| `maintainer` | Repo owner, team with push access | In-repo `.beads/` |
+| `contributor` | Fork contributor, OSS contributor | Separate planning repo |
+
+You can also configure manually:
+
+```bash
+# Set as contributor
+git config beads.role contributor
+
+# Set as maintainer
+git config beads.role maintainer
+
+# Check current role
+git config --get beads.role
+```
+
+**Note:** If `beads.role` is not configured, beads falls back to URL-based detection (deprecated). Run `bd doctor` to check configuration status.
 
 ## Your First Issues
 
@@ -57,6 +87,15 @@ Notes:
 ```
 
 **Note:** Issue IDs are hash-based (e.g., `bd-a1b2`, `bd-f14c`) to prevent collisions when multiple agents/branches work concurrently.
+
+**Dependency visibility:** When issues have blocking dependencies, `bd list` shows them inline:
+```
+○ bd-a1b2 [P1] [task] - Set up database
+○ bd-f14c [P2] [feature] - Create API (blocked by: bd-a1b2)
+○ bd-g25d [P2] [feature] - Add authentication (blocked by: bd-f14c)
+```
+
+This makes dependencies unmissable when reviewing epic subtasks.
 
 ## Hierarchical Issues (Epics)
 
@@ -205,28 +244,6 @@ bd admin cleanup --force
 - Before archiving a project phase
 
 **Note:** Compaction is permanent graceful decay. Original content is discarded but viewable via `bd restore <id>` from git history.
-
-## Background Daemon
-
-bd runs a background daemon for auto-sync and performance. You rarely need to manage it directly:
-
-```bash
-# Check daemon status
-bd info | grep daemon
-
-# List all running daemons
-bd daemons list
-
-# Force direct mode (skip daemon)
-bd --no-daemon ready
-```
-
-**When to disable daemon:**
-- Git worktrees (required: `bd --no-daemon`)
-- CI/CD pipelines
-- Resource-constrained environments
-
-See [DAEMON.md](DAEMON.md) for complete daemon management guide.
 
 ## Next Steps
 

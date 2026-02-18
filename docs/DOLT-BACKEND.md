@@ -36,7 +36,7 @@ dolt version
 bd init --backend=dolt
 
 # Or convert existing SQLite database
-bd migrate --to=dolt
+bd migrate --to-dolt
 ```
 
 ### 3. Configure Sync Mode
@@ -194,6 +194,15 @@ bd import issues.jsonl
 
 ## Troubleshooting
 
+### Already Committed dolt/ to Git
+
+If you committed `.beads/dolt/` before this fix:
+
+1. Update gitignore: `bd doctor --fix`
+2. Remove from git tracking: `git rm --cached -r .beads/dolt/ .beads/dolt-access.lock`
+3. Commit the removal: `git commit -m "fix: remove accidentally committed dolt data"`
+4. To purge from history (optional): use [BFG Repo-Cleaner](https://rtyley.github.io/bfg-repo-cleaner/) or `git filter-repo`
+
 ### Server Won't Start
 
 ```bash
@@ -233,18 +242,6 @@ bd list  # Triggers auto-start
    ```bash
    cd .beads/dolt && dolt gc
    ```
-
-### Lock Contention
-
-Dolt handles concurrent access better in server mode. If you see lock errors:
-
-```bash
-# Check for stale locks
-ls -la .beads/dolt/.dolt/noms/*.lock
-
-# Server mode eliminates most lock issues
-export BEADS_DOLT_SERVER_MODE=1
-```
 
 ## Advanced Usage
 
@@ -337,7 +334,5 @@ federation:
 
 ## See Also
 
-- [Sync Modes](CONFIG.md#sync-mode-configuration) - Detailed sync configuration
-- [Daemon](DAEMON.md) - Background sync daemon
 - [Troubleshooting](TROUBLESHOOTING.md) - General troubleshooting
 - [Dolt Documentation](https://docs.dolthub.com/) - Official Dolt docs

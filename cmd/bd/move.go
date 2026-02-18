@@ -4,12 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/routing"
-	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -98,8 +96,8 @@ Examples:
 		}
 
 		// Step 4: Open storage for the target rig
-		targetDBPath := filepath.Join(targetBeadsDir, "beads.db")
-		targetStore, err := sqlite.New(ctx, targetDBPath)
+		// Use factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
+		targetStore, err := dolt.NewFromConfig(ctx, targetBeadsDir)
 		if err != nil {
 			FatalError("failed to open target rig database: %v", err)
 		}
@@ -171,10 +169,6 @@ Examples:
 			if err := sourceStore.CloseIssue(ctx, resolvedSourceID, closeReason, actor, ""); err != nil {
 				WarnError("failed to close source issue: %v", err)
 			}
-			// Schedule auto-flush if source was local store
-			if !result.Routed {
-				markDirtyAndScheduleFlush()
-			}
 		}
 
 		// Output
@@ -202,7 +196,7 @@ Examples:
 // converted to external references. Dependencies FROM the old ID are removed since they
 // can't be recreated in the source store.
 // Returns the number of dependencies remapped.
-func remapDependencies(ctx context.Context, s storage.Storage, oldID, newID, targetRig, actor string) (int, error) {
+func remapDependencies(ctx context.Context, s *dolt.DoltStore, oldID, newID, targetRig, actor string) (int, error) {
 	count := 0
 
 	// Get dependencies where oldID is the issue (oldID depends on something)

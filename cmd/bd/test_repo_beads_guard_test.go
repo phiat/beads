@@ -5,16 +5,55 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/beads/internal/config"
 )
 
 // Guardrail: ensure the cmd/bd test suite does not touch the real repo .beads state.
 // Disable with BEADS_TEST_GUARD_DISABLE=1 (useful when running tests while actively using beads).
 func TestMain(m *testing.M) {
+	origWD, _ := os.Getwd()
+
+	// Isolate config discovery from the repo's tracked `.beads/config.yaml`.
+	// Many tests expect default config values; running from within this repo would
+	// cause config.Initialize() to walk up from CWD and load `.beads/config.yaml`,
+	// which sets sync.mode=dolt-native and makes tests assert the wrong behavior.
+	tmp, err := os.MkdirTemp("", "beads-bd-tests-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+
+	// Preserve Go build cache before changing HOME.
+	// On macOS, GOCACHE defaults to $HOME/Library/Caches/go-build.
+	// Changing HOME would cause tests that run `go build` (e.g., TestShow)
+	// to miss the cache and do a full CGO rebuild (~80s each).
+	if os.Getenv("GOCACHE") == "" {
+		if out, err := exec.Command("go", "env", "GOCACHE").Output(); err == nil {
+			_ = os.Setenv("GOCACHE", strings.TrimSpace(string(out)))
+		}
+	}
+
+	_ = os.Setenv("HOME", tmp)
+	_ = os.Setenv("USERPROFILE", tmp) // Windows compatibility
+	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg-config"))
+	_ = os.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+
+	// Also reset viper state that was loaded by main.go's init().
+	config.ResetForTesting()
+
 	// Enable test mode that forces accessor functions to use legacy globals.
 	// This ensures backward compatibility with tests that manipulate globals directly.
 	enableTestModeGlobals()
+
+	// Set BEADS_TEST_MODE once for the entire test run (bd-cqjoi).
+	// Previously each test set/unset this env var via ensureTestMode(),
+	// which raced under t.Parallel().
+	_ = os.Setenv("BEADS_TEST_MODE", "1")
 
 	// Prevent daemon auto-start and ensure tests don't interact with any running daemon.
 	// This prevents false positives in the test guard when a background daemon touches
@@ -47,7 +86,7 @@ func TestMain(m *testing.M) {
 	// Stop any running daemon for this repo to prevent false positives in the guard.
 	// The daemon auto-syncs and touches files like issues.jsonl, which would trigger
 	// the guard even though tests didn't cause the change.
-	repoRoot := findRepoRoot()
+	repoRoot := findRepoRootFrom(origWD)
 	if repoRoot != "" {
 		stopRepoDaemon(repoRoot)
 	} else {
@@ -67,7 +106,7 @@ func TestMain(m *testing.M) {
 		"issues.jsonl",
 		"beads.jsonl",
 		"metadata.json",
-		"interactions.jsonl",
+		// interactions.jsonl excluded: legitimately created by init during tests
 		"deletions.jsonl",
 		"molecules.jsonl",
 		"daemon.lock",
@@ -135,6 +174,10 @@ func findRepoRoot() string {
 	if err != nil {
 		return ""
 	}
+	return findRepoRootFrom(wd)
+}
+
+func findRepoRootFrom(wd string) string {
 	for i := 0; i < 25; i++ {
 		if _, err := os.Stat(filepath.Join(wd, "go.mod")); err == nil {
 			return wd

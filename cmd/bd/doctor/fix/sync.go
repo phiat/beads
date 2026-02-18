@@ -2,16 +2,17 @@ package fix
 
 import (
 	"bufio"
-	"database/sql"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // DBJSONLSync fixes database-JSONL sync issues by running the appropriate sync command.
@@ -25,7 +26,14 @@ func DBJSONLSync(path string) error {
 		return err
 	}
 
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+
+	// Dolt backend: Dolt uses native version control (push/pull/merge) instead
+	// of the DB-JSONL sync layer. JSONL is only an optional compatibility export.
+	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendDolt {
+		fmt.Println("  DB-JSONL sync skipped (dolt backend — sync is database-native)")
+		return nil
+	}
 
 	// Get database path (same logic as doctor package)
 	var dbPath string
@@ -64,8 +72,8 @@ func DBJSONLSync(path string) error {
 		return nil // No JSONL, nothing to sync
 	}
 
-	// Count issues in both
-	dbCount, err := countDatabaseIssues(dbPath)
+	// Count issues in both (using factory for backend-agnostic access)
+	dbCount, err := countDatabaseIssues(beadsDir)
 	if err != nil {
 		return fmt.Errorf("failed to count database issues: %w", err)
 	}
@@ -147,21 +155,22 @@ func DBJSONLSync(path string) error {
 	return nil
 }
 
-// countDatabaseIssues counts the number of issues in the database.
-func countDatabaseIssues(dbPath string) (int, error) {
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
+// countDatabaseIssues counts the number of issues in the database using the
+// storage factory for backend-agnostic access (bd-lftxx).
+func countDatabaseIssues(beadsDir string) (int, error) {
+	ctx := context.Background()
+	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return 0, fmt.Errorf("failed to open database: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
-	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM issues").Scan(&count)
+	stats, err := store.GetStatistics(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query database: %w", err)
 	}
 
-	return count, nil
+	return stats.TotalIssues, nil
 }
 
 // countJSONLIssues counts the number of valid issues in a JSONL file.
@@ -198,4 +207,72 @@ func countJSONLIssues(jsonlPath string) (int, error) {
 	}
 
 	return count, nil
+}
+
+// SyncDivergence fixes JSONL-git divergence issues.
+// In dolt-native mode: restores JSONL from git HEAD (Dolt is source of truth).
+// In other modes: delegates to DBJSONLSync for appropriate sync direction.
+func SyncDivergence(path string) error {
+	// Validate workspace
+	if err := validateBeadsWorkspace(path); err != nil {
+		return err
+	}
+
+	beadsDir := filepath.Join(path, ".beads")
+	beadsDir = resolveBeadsDir(beadsDir)
+
+	// In dolt-native mode, restore JSONL from git HEAD since Dolt is source of truth
+	if config.GetSyncMode() == config.SyncModeDoltNative {
+		return restoreJSONLFromGitHead(path, beadsDir)
+	}
+
+	// For other modes, use the existing DB-JSONL sync logic
+	return DBJSONLSync(path)
+}
+
+// restoreJSONLFromGitHead restores the JSONL file from git HEAD.
+// This is used in dolt-native mode where Dolt is source of truth.
+func restoreJSONLFromGitHead(path, beadsDir string) error {
+	// Find JSONL file
+	var jsonlPath string
+	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
+		if cfg.JSONLExport != "" && !isSystemJSONLFilename(cfg.JSONLExport) {
+			p := cfg.JSONLPath(beadsDir)
+			if _, err := os.Stat(p); err == nil {
+				jsonlPath = p
+			}
+		}
+	}
+	if jsonlPath == "" {
+		issuesJSONL := filepath.Join(beadsDir, "issues.jsonl")
+		beadsJSONL := filepath.Join(beadsDir, "beads.jsonl")
+
+		if _, err := os.Stat(issuesJSONL); err == nil {
+			jsonlPath = issuesJSONL
+		} else if _, err := os.Stat(beadsJSONL); err == nil {
+			jsonlPath = beadsJSONL
+		}
+	}
+
+	if jsonlPath == "" {
+		return nil // No JSONL file to restore
+	}
+
+	// Get relative path for git command
+	relPath, err := filepath.Rel(path, jsonlPath)
+	if err != nil {
+		return fmt.Errorf("failed to get relative path: %w", err)
+	}
+
+	// Restore from git HEAD
+	cmd := exec.Command("git", "restore", relPath) // #nosec G204 -- relPath derived from validated file path
+	cmd.Dir = path
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to restore JSONL from git HEAD: %w", err)
+	}
+
+	return nil
 }

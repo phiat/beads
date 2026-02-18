@@ -1,55 +1,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/storage/factory"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/syncbranch"
 )
 
 // ensureDirectMode makes sure the CLI is operating in direct-storage mode.
-// If the daemon is active, it is cleanly disconnected and the shared store is opened.
-func ensureDirectMode(reason string) error {
-	if getDaemonClient() != nil {
-		if err := fallbackToDirectMode(reason); err != nil {
-			return err
-		}
-		return nil
-	}
+func ensureDirectMode(_ string) error {
 	return ensureStoreActive()
-}
-
-// fallbackToDirectMode disables the daemon client and ensures a local store is ready.
-func fallbackToDirectMode(reason string) error {
-	disableDaemonForFallback(reason)
-	return ensureStoreActive()
-}
-
-// disableDaemonForFallback closes the daemon client and updates status metadata.
-func disableDaemonForFallback(reason string) {
-	if client := getDaemonClient(); client != nil {
-		_ = client.Close()
-		setDaemonClient(nil)
-	}
-
-	ds := getDaemonStatus()
-	ds.Mode = "direct"
-	ds.Connected = false
-	ds.Degraded = true
-	if reason != "" {
-		ds.Detail = reason
-	}
-	if ds.FallbackReason == FallbackNone {
-		ds.FallbackReason = FallbackDaemonUnsupported
-	}
-	setDaemonStatus(ds)
-
-	if reason != "" {
-		debug.Logf("Debug: %s\n", reason)
-	}
 }
 
 // ensureStoreActive guarantees that a storage backend is initialized and tracked.
@@ -70,6 +35,15 @@ func ensureStoreActive() error {
 			"      or use 'bd --no-db' for JSONL-only mode")
 	}
 
+	// GH#1349: Ensure sync branch worktree exists if configured.
+	// This must happen before any JSONL operations to fix fresh clone scenario
+	// where findJSONLPath would otherwise fall back to main's stale JSONL.
+	if _, err := syncbranch.EnsureWorktree(context.Background()); err != nil {
+		// Log warning but don't fail - operations can still work with main's JSONL
+		// This allows graceful degradation if worktree creation fails
+		debug.Logf("Warning: could not ensure sync worktree: %v", err)
+	}
+
 	// Check if this is a JSONL-only project
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 	if _, err := os.Stat(jsonlPath); err == nil {
@@ -80,9 +54,9 @@ func ensureStoreActive() error {
 		}
 	}
 
-	// Use factory to create the appropriate backend (SQLite, Dolt embedded, or Dolt server)
+	// Use dolt.NewFromConfig to create the appropriate backend
 	// based on metadata.json configuration
-	store, err := factory.NewFromConfig(getRootContext(), beadsDir)
+	store, err := dolt.NewFromConfig(getRootContext(), beadsDir)
 	if err != nil {
 		// Check for fresh clone scenario (JSONL exists but no database)
 		if _, statErr := os.Stat(jsonlPath); statErr == nil {
@@ -102,10 +76,6 @@ func ensureStoreActive() error {
 	setStore(store)
 	setStoreActive(true)
 	unlockStore()
-
-	if isAutoImportEnabled() {
-		autoImportIfNewer()
-	}
 
 	return nil
 }

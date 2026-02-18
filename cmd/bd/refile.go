@@ -3,11 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/routing"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -78,8 +77,7 @@ Examples:
 		}
 
 		// Step 4: Open storage for the target rig
-		targetDBPath := filepath.Join(targetBeadsDir, "beads.db")
-		targetStore, err := sqlite.New(ctx, targetDBPath)
+		targetStore, err := dolt.NewFromConfig(ctx, targetBeadsDir)
 		if err != nil {
 			FatalError("failed to open target rig database: %v", err)
 		}
@@ -135,10 +133,6 @@ Examples:
 			closeReason := fmt.Sprintf("Refiled to %s", newIssue.ID)
 			if err := result.Store.CloseIssue(ctx, resolvedSourceID, closeReason, actor, ""); err != nil {
 				WarnError("failed to close source issue: %v", err)
-			}
-			// Schedule auto-flush if source was local store
-			if !result.Routed {
-				markDirtyAndScheduleFlush()
 			}
 		}
 

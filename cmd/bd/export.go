@@ -2,8 +2,6 @@ package main
 
 import (
 	"cmp"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,10 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/storage/factory"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
-	"github.com/steveyegge/beads/internal/util"
+	"github.com/steveyegge/beads/internal/utils"
 	"github.com/steveyegge/beads/internal/validation"
 )
 
@@ -137,11 +134,13 @@ Examples:
 		output, _ := cmd.Flags().GetString("output")
 		statusFilter, _ := cmd.Flags().GetString("status")
 		force, _ := cmd.Flags().GetBool("force")
+		eventsFlag, _ := cmd.Flags().GetBool("events")
+		eventsReset, _ := cmd.Flags().GetBool("events-reset")
 
 		// Additional filter flags
 		assignee, _ := cmd.Flags().GetString("assignee")
 		issueType, _ := cmd.Flags().GetString("type")
-		issueType = util.NormalizeIssueType(issueType) // Expand aliases (mr→merge-request, etc.)
+		issueType = utils.NormalizeIssueType(issueType) // Expand aliases (mr→merge-request, etc.)
 		labels, _ := cmd.Flags().GetStringSlice("label")
 		labelsAny, _ := cmd.Flags().GetStringSlice("label-any")
 		priorityMinStr, _ := cmd.Flags().GetString("priority-min")
@@ -166,12 +165,6 @@ Examples:
 		}
 
 		// Export command requires direct database access for consistent snapshot
-		// If daemon is connected, close it and open direct connection
-		if daemonClient != nil {
-			debug.Logf("Debug: export command forcing direct mode (closes daemon connection)\n")
-			_ = daemonClient.Close()
-			daemonClient = nil
-		}
 
 		// Note: We used to check database file timestamps here, but WAL files
 		// get created when opening the DB, making timestamp checks unreliable.
@@ -185,8 +178,8 @@ Examples:
 				os.Exit(1)
 			}
 			beadsDir := filepath.Dir(dbPath)
-			store, err = factory.NewFromConfigWithOptions(rootCtx, beadsDir, factory.Options{
-				LockTimeout: lockTimeout,
+			store, err = dolt.NewFromConfigWithOptions(rootCtx, beadsDir, &dolt.Config{
+				OpenTimeout: lockTimeout,
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
@@ -195,24 +188,39 @@ Examples:
 			defer func() { _ = store.Close() }()
 		}
 
+		// Handle --events and --events-reset flags
+		if eventsFlag || eventsReset {
+			eventsPath := filepath.Join(filepath.Dir(dbPath), "events.jsonl")
+			ctx := rootCtx
+
+			if eventsReset {
+				if err := resetEventsExport(ctx, store, eventsPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error resetting events export: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Events export state reset\n")
+			}
+
+			if eventsFlag {
+				if err := exportEventsToJSONL(ctx, store, eventsPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error exporting events: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Events exported to %s\n", eventsPath)
+			}
+
+			return
+		}
+
 		// Normalize labels: trim, dedupe, remove empty
-		labels = util.NormalizeLabels(labels)
-		labelsAny = util.NormalizeLabels(labelsAny)
+		labels = utils.NormalizeLabels(labels)
+		labelsAny = utils.NormalizeLabels(labelsAny)
 
 		// Build filter
-		// Tombstone export logic:
-		// - No status filter → include tombstones for sync propagation
-		// - --status=tombstone → include only tombstones (filter handles this)
-		// - --status=<other> → exclude tombstones (user wants specific status)
 		filter := types.IssueFilter{}
 		if statusFilter != "" {
 			status := types.Status(statusFilter)
 			filter.Status = &status
-			// Only include tombstones if explicitly filtering for them
-			filter.IncludeTombstones = (status == types.StatusTombstone)
-		} else {
-			// No status filter: include tombstones for sync propagation
-			filter.IncludeTombstones = true
 		}
 		if assignee != "" {
 			filter.Assignee = &assignee
@@ -228,7 +236,7 @@ Examples:
 			filter.LabelsAny = labelsAny
 		}
 		if idFilter != "" {
-			ids := util.NormalizeLabels(strings.Split(idFilter, ","))
+			ids := utils.NormalizeLabels(strings.Split(idFilter, ","))
 			if len(ids) > 0 {
 				filter.IDs = ids
 			}
@@ -521,34 +529,12 @@ Examples:
 		}
 
 		// Report skipped issues if any (helps debugging bd-159)
-		if skippedCount > 0 && (output == "" || output == findJSONLPath()) {
+		if skippedCount > 0 && output == findJSONLPath() {
 			fmt.Fprintf(os.Stderr, "Skipped %d issue(s) with timestamp-only changes\n", skippedCount)
 		}
 
-		// Only clear dirty issues and auto-flush state if exporting to the default JSONL path
-		// This prevents clearing dirty flags when exporting to custom paths (e.g., bd export -o backup.jsonl)
-		if output == "" || output == findJSONLPath() {
-			// Clear only the issues that were actually exported (fixes bd-52 race condition)
-			if err := store.ClearDirtyIssuesByID(ctx, exportedIDs); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to clear dirty issues: %v\n", err)
-			}
-
-			// Clear auto-flush state since we just manually exported
-			// This cancels any pending auto-flush timer and marks DB as clean
-			clearAutoFlushState()
-
-			// Store JSONL file hash for integrity validation
-			// nolint:gosec // G304: finalPath is validated JSONL export path
-			jsonlData, err := os.ReadFile(finalPath)
-			if err == nil {
-				hasher := sha256.New()
-				hasher.Write(jsonlData)
-				fileHash := hex.EncodeToString(hasher.Sum(nil))
-				if err := store.SetJSONLFileHash(ctx, fileHash); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to update jsonl_file_hash: %v\n", err)
-				}
-			}
-		}
+		// Suppress "unused" for exportedIDs (used in JSON stats below)
+		_ = exportedIDs
 
 		// If writing to file, atomically replace the target file
 		if tempFile != nil {
@@ -589,21 +575,6 @@ Examples:
 					os.Exit(1)
 				}
 			}
-
-			// Update database mtime to be >= JSONL mtime (fixes #278, #301, #321)
-			// Only do this when exporting to default JSONL path (not arbitrary outputs)
-			// This prevents validatePreExport from incorrectly blocking on next export
-			if output == "" || output == findJSONLPath() {
-				// Dolt backend does not have a SQLite DB file, so only touch mtime for SQLite.
-				if _, ok := store.(*sqlite.SQLiteStorage); ok {
-					beadsDir := filepath.Dir(finalPath)
-					dbPath := filepath.Join(beadsDir, "beads.db")
-					if err := TouchDatabaseFile(dbPath, finalPath); err != nil {
-						// Log warning but don't fail export
-						fmt.Fprintf(os.Stderr, "Warning: failed to update database mtime: %v\n", err)
-					}
-				}
-			}
 		}
 
 		// Output statistics if JSON format requested
@@ -629,11 +600,13 @@ func init() {
 	exportCmd.Flags().StringP("status", "s", "", "Filter by status")
 	exportCmd.Flags().Bool("force", false, "Force export even if database is empty")
 	exportCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output export statistics in JSON format")
+	exportCmd.Flags().Bool("events", false, "Export events to .beads/events.jsonl (append-only)")
+	exportCmd.Flags().Bool("events-reset", false, "Reset events export state and truncate events.jsonl")
 
 	// Filter flags
 	registerPriorityFlag(exportCmd, "")
 	exportCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
-	exportCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, merge-request, molecule, gate). Aliases: mr→merge-request, feat→feature, mol→molecule")
+	exportCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, decision, merge-request, molecule, gate). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision")
 	exportCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL)")
 	exportCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE)")
 

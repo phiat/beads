@@ -117,7 +117,7 @@ func TestCreateBeadsWorktree(t *testing.T) {
 
 	t.Run("idempotent - calling twice succeeds", func(t *testing.T) {
 		worktreePath2 := filepath.Join(t.TempDir(), "beads-worktree-idempotent")
-		
+
 		// Create once
 		if err := wm.CreateBeadsWorktree("beads-metadata-idempotent", worktreePath2); err != nil {
 			t.Fatalf("First CreateBeadsWorktree failed: %v", err)
@@ -127,7 +127,7 @@ func TestCreateBeadsWorktree(t *testing.T) {
 		if err := wm.CreateBeadsWorktree("beads-metadata-idempotent", worktreePath2); err != nil {
 			t.Errorf("Second CreateBeadsWorktree failed (should be idempotent): %v", err)
 		}
-		
+
 		// Verify worktree still exists and is valid
 		if valid, err := wm.isValidWorktree(worktreePath2); err != nil || !valid {
 			t.Errorf("Worktree should still be valid after idempotent call: valid=%v, err=%v", valid, err)
@@ -171,7 +171,7 @@ func TestCheckWorktreeHealth(t *testing.T) {
 
 	t.Run("healthy worktree passes check", func(t *testing.T) {
 		worktreePath := filepath.Join(t.TempDir(), "beads-worktree")
-		
+
 		if err := wm.CreateBeadsWorktree("beads-metadata", worktreePath); err != nil {
 			t.Fatalf("CreateBeadsWorktree failed: %v", err)
 		}
@@ -183,7 +183,7 @@ func TestCheckWorktreeHealth(t *testing.T) {
 
 	t.Run("non-existent path fails check", func(t *testing.T) {
 		nonExistentPath := filepath.Join(t.TempDir(), "does-not-exist")
-		
+
 		err := wm.CheckWorktreeHealth(nonExistentPath)
 		if err == nil {
 			t.Error("CheckWorktreeHealth should fail for non-existent path")
@@ -280,7 +280,7 @@ func TestIsValidWorktree(t *testing.T) {
 
 	t.Run("created worktree is valid", func(t *testing.T) {
 		worktreePath := filepath.Join(t.TempDir(), "beads-worktree")
-		
+
 		if err := wm.CreateBeadsWorktree("beads-metadata", worktreePath); err != nil {
 			t.Fatalf("CreateBeadsWorktree failed: %v", err)
 		}
@@ -636,18 +636,17 @@ func TestSyncJSONLToWorktreeMerge(t *testing.T) {
 			t.Fatalf("Failed to read result JSONL: %v", err)
 		}
 
-		// Should have all 4 issues (3 from worktree + 1 from local)
+		// 3-way merge removed: mergeJSONLFiles now returns srcData (local wins).
+		// When local has fewer issues, srcData (1 issue) overwrites destination.
 		resultCount := countJSONLIssues(resultData)
-		if resultCount != 4 {
-			t.Errorf("Expected 4 issues after merge, got %d\nContent:\n%s", resultCount, string(resultData))
+		if resultCount != 1 {
+			t.Errorf("Expected 1 issue after local-wins overwrite, got %d\nContent:\n%s", resultCount, string(resultData))
 		}
 
-		// Verify specific issues are present
+		// Verify the local issue is present
 		resultStr := string(resultData)
-		for _, id := range []string{"bd-001", "bd-002", "bd-003", "bd-004"} {
-			if !strings.Contains(resultStr, id) {
-				t.Errorf("Expected issue %s to be in merged result", id)
-			}
+		if !strings.Contains(resultStr, "bd-004") {
+			t.Errorf("Expected issue bd-004 to be in result")
 		}
 	})
 
@@ -798,18 +797,17 @@ func TestSyncJSONLToWorktree_DeleteMutation(t *testing.T) {
 			t.Fatalf("Failed to read result JSONL: %v", err)
 		}
 
-		// Should have all 4 issues (3 from remote + 1 from local, merged)
+		// 3-way merge removed: mergeJSONLFiles now returns srcData (local wins).
+		// When local has fewer issues, srcData (1 issue) overwrites destination.
 		resultCount := countJSONLIssues(resultData)
-		if resultCount != 4 {
-			t.Errorf("Expected 4 issues after merge, got %d\nContent:\n%s", resultCount, string(resultData))
+		if resultCount != 1 {
+			t.Errorf("Expected 1 issue after local-wins overwrite, got %d\nContent:\n%s", resultCount, string(resultData))
 		}
 
-		// Verify all issues are present
+		// Verify the local issue is present
 		resultStr := string(resultData)
-		for _, id := range []string{"bd-200", "bd-201", "bd-202", "bd-203"} {
-			if !strings.Contains(resultStr, id) {
-				t.Errorf("Expected issue %s to be in merged result", id)
-			}
+		if !strings.Contains(resultStr, "bd-203") {
+			t.Errorf("Expected issue bd-203 to be in result")
 		}
 	})
 }
@@ -1344,5 +1342,69 @@ func TestNormalizeBeadsRelPath(t *testing.T) {
 				t.Errorf("NormalizeBeadsRelPath(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+// TestSyncJSONLToWorktree_SelfCopy tests that syncing a file to itself is a no-op.
+// GH#1298: When sync-branch is configured, findJSONLPath() returns the worktree path
+// due to GH#1103. This causes the sync to attempt copying the worktree JSONL to itself.
+// The fix ensures this is detected and skipped without error.
+func TestSyncJSONLToWorktree_SelfCopy(t *testing.T) {
+	repoPath, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	wm := NewWorktreeManager(repoPath)
+	worktreePath := filepath.Join(t.TempDir(), "beads-worktree")
+
+	// Create worktree
+	if err := wm.CreateBeadsWorktree("beads-metadata", worktreePath); err != nil {
+		t.Fatalf("CreateBeadsWorktree failed: %v", err)
+	}
+
+	// Create a JSONL file in the worktree
+	worktreeJSONL := filepath.Join(worktreePath, ".beads", "issues.jsonl")
+	originalData := []byte(`{"id":"bd-001","title":"Test Issue","status":"open"}` + "\n")
+	if err := os.WriteFile(worktreeJSONL, originalData, 0644); err != nil {
+		t.Fatalf("Failed to write worktree JSONL: %v", err)
+	}
+
+	// Get the file's modification time before sync
+	statBefore, err := os.Stat(worktreeJSONL)
+	if err != nil {
+		t.Fatalf("Failed to stat worktree JSONL: %v", err)
+	}
+
+	// Simulate GH#1298: jsonlRelPath includes the worktree path prefix
+	// This happens when findJSONLPath() returns the worktree path due to GH#1103
+	// e.g., ".git/beads-worktrees/beads-metadata/.beads/issues.jsonl"
+	worktreeRelPath, err := filepath.Rel(repoPath, worktreeJSONL)
+	if err != nil {
+		t.Fatalf("Failed to get relative path: %v", err)
+	}
+
+	// Sync with the worktree-relative path (simulates the GH#1298 bug scenario)
+	// This should detect srcPath == dstPath and return nil without modifying the file
+	if err := wm.SyncJSONLToWorktree(worktreePath, worktreeRelPath); err != nil {
+		t.Fatalf("SyncJSONLToWorktree failed: %v", err)
+	}
+
+	// Verify the file was not modified (content unchanged)
+	resultData, err := os.ReadFile(worktreeJSONL)
+	if err != nil {
+		t.Fatalf("Failed to read worktree JSONL after sync: %v", err)
+	}
+
+	if string(resultData) != string(originalData) {
+		t.Errorf("File content changed unexpectedly.\nExpected: %s\nGot: %s", string(originalData), string(resultData))
+	}
+
+	// Verify the file's modification time didn't change (file wasn't rewritten)
+	statAfter, err := os.Stat(worktreeJSONL)
+	if err != nil {
+		t.Fatalf("Failed to stat worktree JSONL after sync: %v", err)
+	}
+
+	if !statAfter.ModTime().Equal(statBefore.ModTime()) {
+		t.Errorf("File was modified when it should have been skipped (self-copy detected)")
 	}
 }

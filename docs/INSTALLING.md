@@ -17,11 +17,14 @@ Beads has several components - here's what they are and when you need them:
 - The **Plugin** enhances Claude Code with slash commands but *requires* the CLI installed
 - The **MCP server** is an *alternative* to the CLI for environments without shell access
 
+**Important:** Beads is installed system-wide, not cloned into your project. The `.beads/` directory in your project only contains the issue database.
+
 **Typical setups:**
 
 | Environment | What to Install |
 |-------------|-----------------|
 | Claude Code, Cursor, Windsurf | bd CLI (+ optional Plugin for Claude Code) |
+| GitHub Copilot (VS Code) | bd CLI + MCP server |
 | Claude Desktop (no shell) | MCP server only |
 | Terminal / scripts | bd CLI only |
 | CI/CD pipelines | bd CLI only |
@@ -42,6 +45,32 @@ brew install beads
 - ✅ No need to install Go
 - ✅ Handles PATH setup automatically
 
+### [Mise-en-place](https://mise.jdx.dev)  (macOS/Linux/Windows)
+
+You can install beads using mise in 2 different ways:
+
+1. Install the latest github release
+
+```bash
+mise install github:steveyegge/beads
+mise use -g github:steveyegge/beads
+```
+
+2.  Build the latest code from git using go:
+
+```bash
+mise install go:github.com/steveyegge/beads/cmd/bd@latest
+mise use -g go:github.com/steveyegge/beads/cmd/bd
+```
+
+**NOTE**: The `-g` enables beads globally.  To enable project-specific versions, omit that.
+
+**Why Mise?**
+- ✅ Same as Homebrew: simple, updates via `mise up`, works without Go, handles PATH
+- ✅ Supports all platforms
+- ✅ Always the latest release
+- ✅ May optionally use a different version for specific projects
+
 ### Quick Install Script (All Platforms)
 
 ```bash
@@ -58,7 +87,7 @@ The installer will:
 
 | Method | Best For | Updates | Prerequisites | Notes |
 |--------|----------|---------|---------------|-------|
-| **Homebrew** | macOS/Linux users | `brew upgrade bd` | Homebrew | Recommended. Handles everything automatically |
+| **Homebrew** | macOS/Linux users | `brew upgrade beads` | Homebrew | Recommended. Handles everything automatically |
 | **npm** | JS/Node.js projects | `npm update -g @beads/bd` | Node.js | Convenient if npm is your ecosystem |
 | **bun** | JS/Bun.js projects | `bun install -g --trust @beads/bd` | Bun.js | Convenient if bun is your ecosystem |
 | **Install script** | Quick setup, CI/CD | Re-run script | curl, bash | Good for automation and one-liners |
@@ -67,6 +96,31 @@ The installer will:
 | **AUR (Arch)** | Arch Linux users | `yay -Syu` | yay/paru | Community-maintained |
 
 **TL;DR:** Use Homebrew if available. Use npm if you're in a Node.js environment. Use the script for quick one-off installs or CI.
+
+## Build Dependencies (go install / from source)
+
+If you install via `go install` or build from source, you need system dependencies for CGO:
+
+macOS (Homebrew):
+```bash
+brew install icu4c zstd
+```
+
+Linux (Debian/Ubuntu):
+```bash
+sudo apt-get install -y libicu-dev libzstd-dev
+```
+
+Linux (Fedora/RHEL):
+```bash
+sudo dnf install -y libicu-devel libzstd-devel
+```
+
+If you see `unicode/uregex.h` missing on macOS, `icu4c` is keg-only. Use:
+```bash
+ICU_PREFIX="$(brew --prefix icu4c)"
+CGO_CFLAGS="-I${ICU_PREFIX}/include" CGO_CPPFLAGS="-I${ICU_PREFIX}/include" CGO_LDFLAGS="-L${ICU_PREFIX}/lib" go install github.com/steveyegge/beads/cmd/bd@latest
+```
 
 ## Platform-Specific Installation
 
@@ -145,18 +199,30 @@ Beads now ships with native Windows support—no MSYS or MinGW required.
 irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
 ```
 
+The script installs a prebuilt Windows release if available. Go is only required for `go install` or building from source.
+
+**Dolt backend on Windows:** Supported via pure-Go regex backend. Windows builds automatically use Go's stdlib `regexp` instead of ICU regex to avoid CGO/header dependencies. If you need full ICU regex semantics, use Linux/macOS (or WSL) with ICU installed.
+
 **Via go install**:
 ```pwsh
 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
+ICU is **not required** on Windows. The regex backend uses pure Go automatically.
+
 **From source**:
 ```pwsh
 git clone https://github.com/steveyegge/beads
 cd beads
-go build -o bd.exe ./cmd/bd
+make build
+# Or without Make:
+go build -tags gms_pure_go -o bd.exe ./cmd/bd
 Move-Item bd.exe $env:USERPROFILE\AppData\Local\Microsoft\WindowsApps\
 ```
+
+The `-tags gms_pure_go` flag tells go-mysql-server to use Go's stdlib regexp instead of ICU.
+Additionally, the vendored go-icu-regex library has a Windows-specific pure-Go implementation
+(`regex_windows.go`) that avoids ICU entirely. No C compiler or ICU libraries are needed.
 
 **Verify installation**:
 ```pwsh
@@ -225,6 +291,54 @@ The plugin adds:
 - Task agent for autonomous execution
 
 See [PLUGIN.md](PLUGIN.md) for complete plugin documentation.
+
+### GitHub Copilot (VS Code)
+
+For VS Code with GitHub Copilot:
+
+1. **Install beads-mcp:**
+   ```bash
+   uv tool install beads-mcp
+   ```
+
+2. **Configure MCP** - Create `.vscode/mcp.json` in your project:
+   ```json
+   {
+     "servers": {
+       "beads": {
+         "command": "beads-mcp"
+       }
+     }
+   }
+   ```
+
+   **For all projects:** Add to VS Code user-level MCP config:
+
+   | Platform | Path |
+   |----------|------|
+   | macOS | `~/Library/Application Support/Code/User/mcp.json` |
+   | Linux | `~/.config/Code/User/mcp.json` |
+   | Windows | `%APPDATA%\Code\User\mcp.json` |
+
+   ```json
+   {
+     "servers": {
+       "beads": {
+         "command": "beads-mcp",
+         "args": []
+       }
+     }
+   }
+   ```
+
+3. **Initialize project:**
+   ```bash
+   bd init --quiet
+   ```
+
+4. **Reload VS Code**
+
+See [COPILOT_INTEGRATION.md](COPILOT_INTEGRATION.md) for complete setup guide.
 
 ### MCP Server (Alternative - for MCP-only environments)
 
@@ -352,10 +466,36 @@ After installation:
 
 ## Updating bd
 
+Use the update command that matches how you installed `bd`.
+
+### Quick Install Script (macOS/Linux/FreeBSD)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+```
+
+### PowerShell Installer (Windows)
+
+```pwsh
+irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+```
+
 ### Homebrew
 
 ```bash
-brew upgrade bd
+brew upgrade beads
+```
+
+### npm
+
+```bash
+npm update -g @beads/bd
+```
+
+### bun
+
+```bash
+bun install -g --trust @beads/bd
 ```
 
 ### go install
@@ -371,6 +511,15 @@ cd beads
 git pull
 go build -o bd ./cmd/bd
 sudo mv bd /usr/local/bin/
+```
+
+## After Upgrading (Recommended)
+
+```bash
+bd info --whats-new
+bd hooks install
+bd daemons killall
+bd version
 ```
 
 ## Uninstalling

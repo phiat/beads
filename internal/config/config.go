@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/internal/debug"
+	"gopkg.in/yaml.v3"
 )
 
 // Sync trigger constants define when sync operations occur.
@@ -42,11 +43,36 @@ func Initialize() error {
 	//    This allows commands to work from subdirectories
 	cwd, err := os.Getwd()
 	if err == nil && !configFileSet {
+		// In the beads repo, `.beads/config.yaml` is tracked and may set sync.mode=dolt-native.
+		// In `go test` (especially for `cmd/bd`), we want to avoid unintentionally picking up
+		// the repo-local config, while still allowing tests to load config.yaml from temp repos.
+		//
+		// If BEADS_TEST_IGNORE_REPO_CONFIG is set, we will ignore the config at
+		// <module-root>/.beads/config.yaml (where module-root is the nearest parent containing go.mod).
+		ignoreRepoConfig := os.Getenv("BEADS_TEST_IGNORE_REPO_CONFIG") != ""
+		var moduleRoot string
+		if ignoreRepoConfig {
+			// Find module root by walking up to go.mod.
+			for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+				if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+					moduleRoot = dir
+					break
+				}
+			}
+		}
+
 		// Walk up parent directories to find .beads/config.yaml
 		for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
 			beadsDir := filepath.Join(dir, ".beads")
 			configPath := filepath.Join(beadsDir, "config.yaml")
 			if _, err := os.Stat(configPath); err == nil {
+				if ignoreRepoConfig && moduleRoot != "" {
+					// Only ignore the repo-local config (moduleRoot/.beads/config.yaml).
+					wantIgnore := filepath.Clean(configPath) == filepath.Clean(filepath.Join(moduleRoot, ".beads", "config.yaml"))
+					if wantIgnore {
+						continue
+					}
+				}
 				// Found .beads/config.yaml - set it explicitly
 				v.SetConfigFile(configPath)
 				configFileSet = true
@@ -83,31 +109,24 @@ func Initialize() error {
 	v.SetEnvPrefix("BD")
 
 	// Replace hyphens and dots with underscores for env var mapping
-	// This allows BD_NO_DAEMON to map to "no-daemon" config key
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	v.AutomaticEnv()
 
 	// Set defaults for all flags
 	v.SetDefault("json", false)
-	v.SetDefault("no-daemon", false)
-	v.SetDefault("no-auto-flush", false)
-	v.SetDefault("no-auto-import", false)
+	v.SetDefault("events-export", false)
 	v.SetDefault("no-db", false)
 	v.SetDefault("db", "")
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")
-	v.SetDefault("lock-timeout", "30s")
-
 	// Additional environment variables (not prefixed with BD_)
 	// These are bound explicitly for backward compatibility
-	_ = v.BindEnv("flush-debounce", "BEADS_FLUSH_DEBOUNCE")
-	_ = v.BindEnv("auto-start-daemon", "BEADS_AUTO_START_DAEMON")
-	_ = v.BindEnv("identity", "BEADS_IDENTITY")
-	_ = v.BindEnv("remote-sync-interval", "BEADS_REMOTE_SYNC_INTERVAL")
+	_ = v.BindEnv("flush-debounce", "BEADS_FLUSH_DEBOUNCE")             // BindEnv only fails with zero args, which can't happen here
+	_ = v.BindEnv("identity", "BEADS_IDENTITY")                         // BindEnv only fails with zero args, which can't happen here
+	_ = v.BindEnv("remote-sync-interval", "BEADS_REMOTE_SYNC_INTERVAL") // BindEnv only fails with zero args, which can't happen here
 
 	// Set defaults for additional settings
 	v.SetDefault("flush-debounce", "30s")
-	v.SetDefault("auto-start-daemon", true)
 	v.SetDefault("identity", "")
 	v.SetDefault("remote-sync-interval", "30s")
 
@@ -165,6 +184,9 @@ func Initialize() error {
 	// Maps directory patterns to labels for automatic filtering in monorepos
 	v.SetDefault("directory.labels", map[string]string{})
 
+	// AI configuration defaults
+	v.SetDefault("ai.model", "claude-haiku-4-5-20251001")
+
 	// External projects for cross-project dependency resolution (bd-h807)
 	// Maps project names to paths for resolving external: blocked_by references
 	v.SetDefault("external_projects", map[string]string{})
@@ -175,6 +197,18 @@ func Initialize() error {
 			return fmt.Errorf("error reading config file: %w", err)
 		}
 		debug.Logf("Debug: loaded config from %s\n", v.ConfigFileUsed())
+
+		// Merge local config overrides if present (config.local.yaml)
+		// This allows machine-specific settings without polluting tracked config
+		configDir := filepath.Dir(v.ConfigFileUsed())
+		localConfigPath := filepath.Join(configDir, "config.local.yaml")
+		if _, err := os.Stat(localConfigPath); err == nil {
+			v.SetConfigFile(localConfigPath)
+			if err := v.MergeInConfig(); err != nil {
+				return fmt.Errorf("error merging local config file: %w", err)
+			}
+			debug.Logf("Debug: merged local config from %s\n", localConfigPath)
+		}
 	} else {
 		// No config.yaml found - use defaults and environment variables
 		debug.Logf("Debug: no config.yaml found; using defaults and environment variables\n")
@@ -340,6 +374,53 @@ func LogOverride(override ConfigOverride) {
 		override.Key, overrideDesc, override.OriginalValue, sourceDesc, override.EffectiveValue)
 }
 
+// SaveConfigValue sets a key-value pair and writes it to the config file.
+// If no config file is currently loaded, it creates config.yaml in the given beadsDir.
+// Only the specified key is modified; other file contents are preserved.
+func SaveConfigValue(key string, value interface{}, beadsDir string) error {
+	if v == nil {
+		return fmt.Errorf("config not initialized")
+	}
+	v.Set(key, value)
+
+	configPath := v.ConfigFileUsed()
+	if configPath == "" {
+		configPath = filepath.Join(beadsDir, "config.yaml")
+		v.SetConfigFile(configPath)
+	}
+
+	// Read existing file contents to avoid dumping all merged viper state
+	// (defaults, env vars, overrides) into the config file.
+	existing := make(map[string]interface{})
+	if data, err := os.ReadFile(configPath); err == nil {
+		_ = yaml.Unmarshal(data, &existing)
+	}
+
+	// Set the single key using dot-path splitting for nested keys (e.g. "sync.mode").
+	setNestedKey(existing, key, value)
+
+	out, err := yaml.Marshal(existing)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	return os.WriteFile(configPath, out, 0o644)
+}
+
+// setNestedKey sets a value in a nested map using a dot-separated key path.
+func setNestedKey(m map[string]interface{}, key string, value interface{}) {
+	parts := strings.SplitN(key, ".", 2)
+	if len(parts) == 1 {
+		m[key] = value
+		return
+	}
+	sub, ok := m[parts[0]].(map[string]interface{})
+	if !ok {
+		sub = make(map[string]interface{})
+		m[parts[0]] = sub
+	}
+	setNestedKey(sub, parts[1], value)
+}
+
 // GetString retrieves a string configuration value
 func GetString(key string) string {
 	if v == nil {
@@ -389,6 +470,12 @@ func Set(key string, value interface{}) {
 // 	}
 // 	return v.BindPFlag(key, flag)
 // }
+
+// DefaultAIModel returns the configured AI model identifier.
+// Override via: bd config set ai.model "model-name" or BD_AI_MODEL=model-name
+func DefaultAIModel() string {
+	return GetString("ai.model")
+}
 
 // AllSettings returns all configuration settings as a map
 func AllSettings() map[string]interface{} {
@@ -579,8 +666,8 @@ func GetSyncConfig() SyncConfig {
 
 // ConflictConfig holds the conflict resolution configuration.
 type ConflictConfig struct {
-	Strategy ConflictStrategy          // newest, ours, theirs, manual (default for all fields)
-	Fields   map[string]FieldStrategy  // Per-field strategy overrides
+	Strategy ConflictStrategy         // newest, ours, theirs, manual (default for all fields)
+	Fields   map[string]FieldStrategy // Per-field strategy overrides
 }
 
 // GetConflictConfig returns the current conflict resolution configuration.
@@ -695,31 +782,21 @@ func NeedsJSONL() bool {
 	return mode == SyncModeGitPortable || mode == SyncModeRealtime || mode == SyncModeBeltAndSuspenders
 }
 
+// NeedsJSONLImport returns true if the sync mode should import from JSONL.
+// In dolt-native mode, imports are disabled to prevent stale JSONL from
+// overwriting dolt data. This is for use by internal/rpc which can't
+// import cmd/bd.
+func NeedsJSONLImport() bool {
+	mode := GetSyncMode()
+	return mode != SyncModeDoltNative
+}
+
 // GetCustomTypesFromYAML retrieves custom issue types from config.yaml.
 // This is used as a fallback when the database doesn't have types.custom set yet
 // (e.g., during bd init auto-import before the database is fully configured).
 // Returns nil if no custom types are configured in config.yaml.
 func GetCustomTypesFromYAML() []string {
-	if v == nil {
-		return nil
-	}
-
-	// Try to get types.custom from viper (config.yaml or env var)
-	value := v.GetString("types.custom")
-	if value == "" {
-		return nil
-	}
-
-	// Parse comma-separated list
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		trimmed := strings.TrimSpace(p)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
+	return getConfigList("types.custom")
 }
 
 // GetCustomStatusesFromYAML retrieves custom statuses from config.yaml.
@@ -727,17 +804,46 @@ func GetCustomTypesFromYAML() []string {
 // or when the database connection is temporarily unavailable.
 // Returns nil if no custom statuses are configured in config.yaml.
 func GetCustomStatusesFromYAML() []string {
+	return getConfigList("status.custom")
+}
+
+// ===== Agent Role Configuration =====
+// These functions return agent role types from config.yaml for agent ID parsing.
+// Each role category has different parsing semantics:
+//   - Town-level: <prefix>-<role> (singleton, no rig)
+//   - Rig-level: <prefix>-<rig>-<role> (singleton per rig)
+//   - Named: <prefix>-<rig>-<role>-<name> (multiple per rig)
+
+// GetTownLevelRoles returns roles that are town-level singletons.
+// These roles have no rig association and appear as: <prefix>-<role>
+func GetTownLevelRoles() []string {
+	return getConfigList("agent_roles.town_level")
+}
+
+// GetRigLevelRoles returns roles that are rig-level singletons.
+// These roles have one instance per rig: <prefix>-<rig>-<role>
+func GetRigLevelRoles() []string {
+	return getConfigList("agent_roles.rig_level")
+}
+
+// GetNamedRoles returns roles that can have multiple named instances per rig.
+// These roles include a name suffix: <prefix>-<rig>-<role>-<name>
+func GetNamedRoles() []string {
+	return getConfigList("agent_roles.named")
+}
+
+// getConfigList is a helper that retrieves a comma-separated list from config.yaml.
+func getConfigList(key string) []string {
 	if v == nil {
+		debug.Logf("config: viper not initialized, returning nil for key %q", key)
 		return nil
 	}
 
-	// Try to get status.custom from viper (config.yaml or env var)
-	value := v.GetString("status.custom")
+	value := v.GetString(key)
 	if value == "" {
 		return nil
 	}
 
-	// Parse comma-separated list
 	parts := strings.Split(value, ",")
 	result := make([]string, 0, len(parts))
 	for _, p := range parts {

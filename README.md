@@ -2,6 +2,8 @@
 
 **Distributed, git-backed graph issue tracker for AI agents.**
 
+**Platforms:** macOS, Linux, Windows, FreeBSD
+
 [![License](https://img.shields.io/github/license/steveyegge/beads)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/steveyegge/beads)](https://goreportcard.com/report/github.com/steveyegge/beads)
 [![Release](https://img.shields.io/github/v/release/steveyegge/beads)](https://github.com/steveyegge/beads/releases)
@@ -13,24 +15,27 @@ Beads provides a persistent, structured memory for coding agents. It replaces me
 ## ⚡ Quick Start
 
 ```bash
-# Install (macOS/Linux/FreeBSD)
+# Install beads CLI (system-wide - don't clone this repo into your project)
 curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
 
-# Initialize (Humans run this once)
+# Initialize in YOUR project
+cd your-project
 bd init
 
 # Tell your agent
 echo "Use 'bd' for task tracking" >> AGENTS.md
-
 ```
+
+**Note:** Beads is a CLI tool you install once and use everywhere. You don't need to clone this repository into your project.
 
 ## 🛠 Features
 
-* **Git as Database:** Issues stored as JSONL in `.beads/`. Versioned, branched, and merged like code.
+* **[Dolt](https://github.com/dolthub/dolt)-Powered:** Version-controlled SQL database with cell-level merge and native branching. JSONL maintained for git portability.
 * **Agent-Optimized:** JSON output, dependency tracking, and auto-ready task detection.
 * **Zero Conflict:** Hash-based IDs (`bd-a1b2`) prevent merge collisions in multi-agent/multi-branch workflows.
-* **Invisible Infrastructure:** SQLite local cache for speed; background daemon for auto-sync.
 * **Compaction:** Semantic "memory decay" summarizes old closed tasks to save context window.
+* **Messaging:** Message issue type with threading (`--thread`), ephemeral lifecycle, and mail delegation.
+* **Graph Links:** `relates_to`, `duplicates`, `supersedes`, and `replies_to` for knowledge graphs.
 
 ## 📖 Essential Commands
 
@@ -38,6 +43,7 @@ echo "Use 'bd' for task tracking" >> AGENTS.md
 | --- | --- |
 | `bd ready` | List tasks with no open blockers. |
 | `bd create "Title" -p 0` | Create a P0 task. |
+| `bd update <id> --claim` | Atomically claim a task (sets assignee + in_progress). |
 | `bd dep add <child> <parent>` | Link tasks (blocks, related, parent-child). |
 | `bd show <id>` | View task details and audit trail. |
 
@@ -70,5 +76,5 @@ See [docs/COMMUNITY_TOOLS.md](docs/COMMUNITY_TOOLS.md) for a curated list of com
 
 ## 📝 Documentation
 
-* [Installing](docs/INSTALLING.md) | [Agent Workflow](AGENT_INSTRUCTIONS.md) | [Articles](ARTICLES.md) | [Sync Branch Mode](docs/PROTECTED_BRANCHES.md) | [Troubleshooting](docs/TROUBLESHOOTING.md) | [FAQ](docs/FAQ.md)
+* [Installing](docs/INSTALLING.md) | [Agent Workflow](AGENT_INSTRUCTIONS.md) | [Copilot Setup](docs/COPILOT_INTEGRATION.md) | [Articles](ARTICLES.md) | [Sync Branch Mode](docs/PROTECTED_BRANCHES.md) | [Troubleshooting](docs/TROUBLESHOOTING.md) | [FAQ](docs/FAQ.md)
 * [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/steveyegge/beads)

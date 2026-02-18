@@ -2,27 +2,24 @@ package fix
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// CleanupResult contains the results of a cleanup operation
-type CleanupResult struct {
-	DeletedCount   int
-	TombstoneCount int
-	SkippedPinned  int
+// cleanupResult contains the results of a cleanup operation
+type cleanupResult struct {
+	DeletedCount  int
+	SkippedPinned int
 }
 
-// StaleClosedIssues converts stale closed issues to tombstones.
+// StaleClosedIssues deletes stale closed issues.
 // This is the fix handler for the "Stale Closed Issues" doctor check.
 //
 // This fix is DISABLED by default (stale_closed_issues_days=0). Users must
@@ -32,12 +29,18 @@ func StaleClosedIssues(path string) error {
 		return err
 	}
 
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 
 	// Load config and check if cleanup is enabled
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Dolt backend: this fix uses SQLite-specific storage, skip for now
+	if cfg != nil && cfg.GetBackend() == configfile.BackendDolt {
+		fmt.Println("  Stale closed issues cleanup skipped (dolt backend)")
+		return nil
 	}
 
 	// Get threshold; 0 means disabled
@@ -51,21 +54,9 @@ func StaleClosedIssues(path string) error {
 		return nil
 	}
 
-	// Get database path
-	var dbPath string
-	if cfg != nil && cfg.Database != "" {
-		dbPath = cfg.DatabasePath(beadsDir)
-	} else {
-		dbPath = filepath.Join(beadsDir, beads.CanonicalDatabaseName)
-	}
-
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		fmt.Println("  No database found, nothing to clean up")
-		return nil
-	}
-
+	// Open database using factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
 	ctx := context.Background()
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.NewFromConfig(ctx, beadsDir)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -113,85 +104,6 @@ func StaleClosedIssues(path string) error {
 	return nil
 }
 
-// ExpiredTombstones prunes expired tombstones from issues.jsonl.
-// This is the fix handler for the "Expired Tombstones" doctor check.
-func ExpiredTombstones(path string) error {
-	if err := validateBeadsWorkspace(path); err != nil {
-		return err
-	}
-
-	beadsDir := filepath.Join(path, ".beads")
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-		fmt.Println("  No JSONL file found, nothing to prune")
-		return nil
-	}
-
-	// Read all issues
-	file, err := os.Open(jsonlPath) // #nosec G304 - path constructed safely
-	if err != nil {
-		return fmt.Errorf("failed to open issues.jsonl: %w", err)
-	}
-
-	var allIssues []*types.Issue
-	decoder := json.NewDecoder(file)
-	for {
-		var issue types.Issue
-		if err := decoder.Decode(&issue); err != nil {
-			break
-		}
-		issue.SetDefaults()
-		allIssues = append(allIssues, &issue)
-	}
-	_ = file.Close()
-
-	ttl := types.DefaultTombstoneTTL
-
-	// Filter out expired tombstones
-	var kept []*types.Issue
-	var prunedCount int
-	for _, issue := range allIssues {
-		if issue.IsExpired(ttl) {
-			prunedCount++
-		} else {
-			kept = append(kept, issue)
-		}
-	}
-
-	if prunedCount == 0 {
-		fmt.Println("  No expired tombstones to prune")
-		return nil
-	}
-
-	// Write back the pruned file atomically
-	tempFile, err := os.CreateTemp(beadsDir, "issues.jsonl.prune.*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tempPath := tempFile.Name()
-
-	encoder := json.NewEncoder(tempFile)
-	for _, issue := range kept {
-		if err := encoder.Encode(issue); err != nil {
-			_ = tempFile.Close()
-			_ = os.Remove(tempPath)
-			return fmt.Errorf("failed to write issue %s: %w", issue.ID, err)
-		}
-	}
-	_ = tempFile.Close()
-
-	// Atomically replace
-	if err := os.Rename(tempPath, jsonlPath); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to replace issues.jsonl: %w", err)
-	}
-
-	ttlDays := int(ttl.Hours() / 24)
-	fmt.Printf("  Pruned %d expired tombstone(s) (older than %d days)\n", prunedCount, ttlDays)
-	return nil
-}
-
 // PatrolPollution deletes patrol digest and session ended beads that pollute the database.
 // This is the fix handler for the "Patrol Pollution" doctor check.
 //
@@ -199,13 +111,13 @@ func ExpiredTombstones(path string) error {
 // - Patrol digests: titles matching "Digest: mol-*-patrol"
 // - Session ended beads: titles matching "Session ended: *"
 //
-// After deletion, runs compact --purge-tombstones equivalent to clean up.
+// After deletion, cleans up any orphaned data.
 func PatrolPollution(path string) error {
 	if err := validateBeadsWorkspace(path); err != nil {
 		return err
 	}
 
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 
 	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
@@ -213,16 +125,9 @@ func PatrolPollution(path string) error {
 		return nil
 	}
 
-	// Get database path
-	var dbPath string
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.Database != "" {
-		dbPath = cfg.DatabasePath(beadsDir)
-	} else {
-		dbPath = filepath.Join(beadsDir, beads.CanonicalDatabaseName)
-	}
-
+	// Open database using factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
 	ctx := context.Background()
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.NewFromConfig(ctx, beadsDir)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -238,11 +143,6 @@ func PatrolPollution(path string) error {
 	var toDelete []string
 
 	for _, issue := range issues {
-		// Skip tombstones
-		if issue.DeletedAt != nil {
-			continue
-		}
-
 		title := issue.Title
 
 		// Check for patrol digest pattern: "Digest: mol-*-patrol"
@@ -282,9 +182,6 @@ func PatrolPollution(path string) error {
 		fmt.Printf("  Deleted %d session ended bead(s)\n", sessionBeadCount)
 	}
 	fmt.Printf("  Total: %d pollution bead(s) removed\n", deleted)
-
-	// Suggest running compact to purge tombstones
-	fmt.Println("  💡 Run 'bd compact --purge-tombstones' to reclaim space")
 
 	return nil
 }

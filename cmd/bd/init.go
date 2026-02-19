@@ -19,7 +19,6 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/dolt"
-	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -51,7 +50,6 @@ be set via BEADS_DOLT_PASSWORD environment variable.`,
 	Run: func(cmd *cobra.Command, _ []string) {
 		prefix, _ := cmd.Flags().GetString("prefix")
 		quiet, _ := cmd.Flags().GetBool("quiet")
-		branch, _ := cmd.Flags().GetString("branch")
 		contributor, _ := cmd.Flags().GetBool("contributor")
 		team, _ := cmd.Flags().GetBool("team")
 		stealth, _ := cmd.Flags().GetBool("stealth")
@@ -327,7 +325,8 @@ be set via BEADS_DOLT_PASSWORD environment variable.`,
 		if err != nil {
 			// If the backend requires CGO but this is a nocgo build, fall back to JSONL-only mode.
 			// This enables Windows CI (CGO_ENABLED=0) and other pure-Go builds to use bd init.
-			if strings.Contains(err.Error(), "requires CGO") {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "requires CGO") || strings.Contains(errMsg, "without CGO support") {
 				if !quiet {
 					fmt.Fprintf(os.Stderr, "Note: %s backend requires CGO (not available in this build).\n", backend)
 					fmt.Fprintf(os.Stderr, "Falling back to JSONL-only mode.\n\n")
@@ -490,27 +489,6 @@ be set via BEADS_DOLT_PASSWORD environment variable.`,
 			}
 		}
 
-		// Set sync.branch only if explicitly specified via --branch flag
-		// GH#807: Do NOT auto-detect current branch - if sync.branch is set to main/master,
-		// the worktree created by bd sync will check out main, preventing the user from
-		// checking out main in their working directory (git error: "'main' is already checked out")
-		//
-		// When --branch is not specified, bd sync will commit directly to the current branch
-		// (the original behavior before sync branch feature)
-		//
-		// GH#927: This must run AFTER createConfigYaml() so that config.yaml exists
-		// and syncbranch.Set() can update it via config.SetYamlConfig() (PR#910 mechanism)
-		if branch != "" {
-			if err := syncbranch.Set(ctx, store, branch); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to set sync branch: %v\n", err)
-				_ = store.Close()
-				os.Exit(1)
-			}
-			if !quiet {
-				fmt.Printf("  Sync branch: %s\n", branch)
-			}
-		}
-
 		// Initialize last_import_time metadata to mark the database as synced.
 		// This prevents bd doctor from reporting "No last_import_time recorded in database"
 		// after init completes. Sets the metadata to current time in RFC3339 format.
@@ -590,6 +568,15 @@ be set via BEADS_DOLT_PASSWORD environment variable.`,
 			}
 		}
 
+		// Auto-commit Dolt state so bd doctor doesn't warn about uncommitted
+		// changes and users don't need a separate "bd vc commit" step.
+		if err := store.Commit(ctx, "bd init"); err != nil {
+			// Non-fatal: some setups (e.g. no tables yet) may have nothing to commit
+			if !strings.Contains(err.Error(), "nothing to commit") {
+				fmt.Fprintf(os.Stderr, "Warning: failed to commit initial state: %v\n", err)
+			}
+		}
+
 		if err := store.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to close database: %v\n", err)
 		}
@@ -652,23 +639,6 @@ be set via BEADS_DOLT_PASSWORD environment variable.`,
 					}
 				} else if !quiet {
 					fmt.Fprintf(os.Stderr, "\n%s Failed to load embedded hooks: %v\n", ui.RenderWarn("⚠"), err)
-				}
-			}
-		}
-
-		// Set git index flags to hide JSONL from git status when sync.branch is configured.
-		// These flags are local-only (don't transfer via git clone), so each clone needs them set.
-		// This fixes the issue where fresh clones show .beads/issues.jsonl as modified.
-		if isGitRepo() {
-			if branch != "" {
-				// --branch flag was passed: set flags directly (in-memory config not updated yet)
-				if err := doctor.SetSyncBranchGitignoreFlags(cwd); err != nil && !quiet {
-					fmt.Fprintf(os.Stderr, "Warning: failed to set git index flags: %v\n", err)
-				}
-			} else {
-				// No --branch flag: check if sync-branch exists in config.yaml (cloned repo scenario)
-				if err := doctor.FixSyncBranchGitignore(); err != nil && !quiet {
-					fmt.Fprintf(os.Stderr, "Warning: failed to set git index flags: %v\n", err)
 				}
 			}
 		}
@@ -756,7 +726,6 @@ be set via BEADS_DOLT_PASSWORD environment variable.`,
 func init() {
 	initCmd.Flags().StringP("prefix", "p", "", "Issue prefix (default: current directory name)")
 	initCmd.Flags().BoolP("quiet", "q", false, "Suppress output (quiet mode)")
-	initCmd.Flags().StringP("branch", "b", "", "Git branch for beads commits (default: current branch)")
 	initCmd.Flags().Bool("contributor", false, "Run OSS contributor setup wizard")
 	initCmd.Flags().Bool("team", false, "Run team workflow setup wizard")
 	initCmd.Flags().Bool("stealth", false, "Enable stealth mode: global gitattributes and gitignore, no local repo tracking")

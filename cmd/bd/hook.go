@@ -345,14 +345,6 @@ func hookPreCommit() int {
 		}
 	}
 
-	// Check if sync-branch is configured (changes go to separate branch)
-	if hookGetSyncBranch() != "" {
-		if cfg.ChainStrategy == ChainAfter {
-			return runChainedHookWithConfig("pre-commit", nil, cfg)
-		}
-		return 0
-	}
-
 	// Get worktree root for per-worktree state tracking
 	worktreeRoot, err := getWorktreeRoot()
 	if err != nil {
@@ -360,7 +352,9 @@ func hookPreCommit() int {
 		worktreeRoot = beadsDir // Fallback
 	}
 
-	// Check if we're using Dolt backend - use branch-then-merge pattern
+	// Check if we're using Dolt backend - use branch-then-merge pattern.
+	// Dolt export must run even when sync-branch is configured, otherwise
+	// the JSONL file never gets updated and bd doctor reports a count mismatch.
 	backend := dolt.GetBackendFromConfig(beadsDir)
 	if backend == configfile.BackendDolt {
 		exitCode := hookPreCommitDolt(beadsDir, worktreeRoot)
@@ -370,49 +364,7 @@ func hookPreCommit() int {
 		return exitCode
 	}
 
-	// SQLite backend: Use existing sync --flush-only
-	cmd := exec.Command("bd", "sync", "--flush-only")
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "Warning: Failed to flush bd changes to JSONL")
-		fmt.Fprintln(os.Stderr, "Run 'bd sync --flush-only' manually to diagnose")
-	}
-
-	// Stage JSONL files
-	if os.Getenv("BEADS_NO_AUTO_STAGE") == "" {
-		rc, rcErr := beads.GetRepoContext()
-		ctx := context.Background()
-		for _, f := range jsonlFilePaths {
-			if _, err := os.Stat(f); err == nil {
-				var gitAdd *exec.Cmd
-				if rcErr == nil {
-					gitAdd = rc.GitCmdCWD(ctx, "add", f)
-				} else {
-					// #nosec G204 -- f comes from jsonlFilePaths (controlled, hardcoded paths)
-					gitAdd = exec.Command("git", "add", f)
-				}
-				_ = gitAdd.Run() // Best effort: file may not be tracked in git
-			}
-		}
-	}
-
-	// Update export state
-	currentCommit, _ := getCurrentGitCommit()
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	jsonlHash, _ := computeJSONLHashForHook(jsonlPath)
-
-	state := &ExportState{
-		WorktreeRoot:     worktreeRoot,
-		LastExportCommit: currentCommit,
-		LastExportTime:   time.Now(),
-		JSONLHash:        jsonlHash,
-	}
-	if err := saveExportState(beadsDir, worktreeRoot, state); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not save export state: %v\n", err)
-	}
-
-	if cfg.ChainStrategy == ChainAfter {
-		return runChainedHookWithConfig("pre-commit", nil, cfg)
-	}
+	// Backend is always Dolt; non-Dolt paths removed.
 	return 0
 }
 
@@ -432,21 +384,20 @@ func hookPreCommitDolt(beadsDir, worktreeRoot string) int {
 	// Load previous export state for this worktree
 	prevState, _ := loadExportState(beadsDir, worktreeRoot)
 
-	// Create storage
-	doltPath := filepath.Join(beadsDir, "dolt")
-	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath})
+	// Open storage using config — use a local variable to avoid shadowing the global store.
+	hookStore, err := dolt.NewFromConfig(ctx, beadsDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not open database: %v\n", err)
 		return 0
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = hookStore.Close() }()
 
 	// Get current Dolt commit hash
-	currentDoltCommit, err := store.GetCurrentCommit(ctx)
+	currentDoltCommit, err := hookStore.GetCurrentCommit(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not get Dolt commit: %v\n", err)
 		// Fall back to full export without commit tracking
-		doExportAndSaveState(ctx, beadsDir, worktreeRoot, "")
+		doExportAndSaveState(ctx, hookStore, beadsDir, worktreeRoot, "")
 		return 0
 	}
 
@@ -458,7 +409,7 @@ func hookPreCommitDolt(beadsDir, worktreeRoot string) int {
 
 	// Check if there are actual changes to export (optimization)
 	if prevState != nil && prevState.LastExportCommit != "" {
-		hasChanges, err := hasDoltChanges(ctx, store, prevState.LastExportCommit, currentDoltCommit)
+		hasChanges, err := hasDoltChanges(ctx, hookStore, prevState.LastExportCommit, currentDoltCommit)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not check for changes: %v\n", err)
 			// Continue with export to be safe
@@ -469,21 +420,22 @@ func hookPreCommitDolt(beadsDir, worktreeRoot string) int {
 		}
 	}
 
-	doExportAndSaveState(ctx, beadsDir, worktreeRoot, currentDoltCommit)
+	doExportAndSaveState(ctx, hookStore, beadsDir, worktreeRoot, currentDoltCommit)
 	return 0
 }
 
 // doExportAndSaveState performs the export and saves state. Shared by main path and fallback.
-func doExportAndSaveState(ctx context.Context, beadsDir, worktreeRoot, doltCommit string) {
+// Uses the already-open store directly to avoid spawning a subprocess that would
+// deadlock on the same Dolt access lock.
+func doExportAndSaveState(ctx context.Context, s *dolt.DoltStore, beadsDir, worktreeRoot, doltCommit string) {
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 
-	// Export to JSONL
-	if err := runJSONLExport(); err != nil {
+	// Export to JSONL using the already-open store
+	if err := exportToJSONLWithStore(ctx, s, jsonlPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not export to JSONL: %v\n", err)
 		return
 	}
 
-	// Stage JSONL files for git commit
 	stageJSONLFiles(ctx)
 
 	// Save export state
@@ -519,12 +471,6 @@ func updateExportStateCommit(beadsDir, worktreeRoot, doltCommit string) {
 	prevState.LastExportCommit = doltCommit
 	prevState.LastExportTime = time.Now()
 	_ = saveExportState(beadsDir, worktreeRoot, prevState) // Best effort: export state is advisory
-}
-
-// runJSONLExport runs the actual JSONL export via bd sync.
-func runJSONLExport() error {
-	cmd := exec.Command("bd", "sync", "--flush-only")
-	return cmd.Run()
 }
 
 // stageJSONLFiles stages JSONL files for git commit (unless BEADS_NO_AUTO_STAGE is set).
@@ -590,22 +536,7 @@ func hookPostMerge(args []string) int {
 		return exitCode
 	}
 
-	// SQLite backend: Use existing sync --import-only
-	cmd := exec.Command("bd", "sync", "--import-only", "--no-git-history")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Warning: Failed to sync bd changes after merge")
-		fmt.Fprintln(os.Stderr, string(output))
-		fmt.Fprintln(os.Stderr, "Run 'bd doctor --fix' to diagnose and repair")
-	}
-
-	// Run quick health check
-	healthCmd := exec.Command("bd", "doctor", "--check-health")
-	_ = healthCmd.Run()
-
-	if cfg.ChainStrategy == ChainAfter {
-		return runChainedHookWithConfig("post-merge", args, cfg)
-	}
+	// Backend is always Dolt; non-Dolt paths removed.
 	return 0
 }
 
@@ -618,9 +549,8 @@ func hookPostMerge(args []string) int {
 func hookPostMergeDolt(beadsDir string) int {
 	ctx := context.Background()
 
-	// Create storage
-	doltPath := filepath.Join(beadsDir, "dolt")
-	store, err := dolt.New(ctx, &dolt.Config{Path: doltPath})
+	// Open storage using config to get the correct database name (e.g. "beads_bd")
+	store, err := dolt.NewFromConfig(ctx, beadsDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not open database: %v\n", err)
 		return 0
@@ -790,33 +720,7 @@ func hookPostCheckout(args []string) int {
 		return exitCode
 	}
 
-	// SQLite backend: Use existing sync --import-only
-	cmd := exec.Command("bd", "sync", "--import-only", "--no-git-history")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Warning: Failed to sync bd changes after checkout")
-		fmt.Fprintln(os.Stderr, string(output))
-		fmt.Fprintln(os.Stderr, "Run 'bd doctor --fix' to diagnose and repair")
-	}
-
-	// Update state after import
-	newHash, _ := computeJSONLHashForHook(jsonlPath)
-	currentCommit, _ := getCurrentGitCommit()
-	state := &ExportState{
-		WorktreeRoot:     worktreeRoot,
-		LastExportCommit: currentCommit,
-		LastExportTime:   time.Now(),
-		JSONLHash:        newHash,
-	}
-	_ = saveExportState(beadsDir, worktreeRoot, state) // Best effort: export state is advisory
-
-	// Run quick health check
-	healthCmd := exec.Command("bd", "doctor", "--check-health")
-	_ = healthCmd.Run()
-
-	if cfg.ChainStrategy == ChainAfter {
-		return runChainedHookWithConfig("post-checkout", args, cfg)
-	}
+	// Backend is always Dolt; non-Dolt paths removed.
 	return 0
 }
 

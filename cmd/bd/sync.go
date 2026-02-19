@@ -1,19 +1,24 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 )
 
-// syncCmd is a no-op kept for backward compatibility.
-// Models and scripts have "bd sync" in muscle memory from the JSONL era.
-// With Dolt-native storage, writes are persisted immediately — there is nothing to sync.
+// syncCmd exports Dolt database to JSONL for backward compatibility.
+// With Dolt-native storage, writes are persisted immediately — but callers
+// (hooks, scripts) still expect "bd sync" to produce an up-to-date JSONL file.
 var syncCmd = &cobra.Command{
 	Use:     "sync",
 	GroupID: "sync",
-	Short:   "No-op (Dolt persists writes immediately)",
+	Short:   "Export database to JSONL (Dolt persists writes immediately)",
 	Long: `With Dolt-native storage, all writes are persisted immediately.
-There is nothing to sync. This command exists for backward compatibility
-and returns instantly.
+This command exports the database to JSONL so that the on-disk JSONL file
+stays in sync with Dolt, which is required by bd doctor and git-based workflows.
 
 For Dolt remote operations, use:
   bd dolt push     Push to Dolt remote
@@ -23,7 +28,32 @@ For data interchange:
   bd export        Export database to JSONL
   bd import        Import JSONL into database`,
 	Run: func(_ *cobra.Command, _ []string) {
-		// Silent no-op. Dolt persists writes immediately.
+		// The global store is already opened by PersistentPreRun with the
+		// access lock held. Use it directly instead of spawning a subprocess
+		// (which would deadlock on the same lock).
+		if store == nil {
+			return // No database open, nothing to export
+		}
+		beadsDir := beads.FindBeadsDir()
+		if beadsDir == "" {
+			return
+		}
+		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+		if err := exportToJSONLWithStore(rootCtx, store, jsonlPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: export failed: %v\n", err)
+		}
+
+		// Dolt-in-Git: if the Dolt store has a git remote configured,
+		// push natively via DOLT_PUSH. This is additive — runs after
+		// JSONL export succeeds (backward compat preserved).
+		if hasRemote, err := store.HasRemote(rootCtx, "origin"); err == nil && hasRemote {
+			if err := store.Push(rootCtx); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Dolt push failed: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Pushed to Dolt git remote\n")
+			}
+		}
+
 	},
 }
 
